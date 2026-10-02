@@ -26,15 +26,25 @@ def generate_reply(*args, **kwargs):
         and (shared.model.__class__.__name__ != 'LlamaServer' or shared.args.parallel > 1)
     )
 
+    stop_event = state.get('stop_event')
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError('Generation was interrupted before starting.')
     if not use_parallel:
-        shared.generation_lock.acquire()
+        if stop_event is None:
+            shared.generation_lock.acquire()
+        else:
+            while not shared.generation_lock.acquire(timeout=0.1):
+                if stop_event.is_set():
+                    raise InterruptedError('Generation was interrupted while waiting for the model.')
+            if stop_event.is_set():
+                shared.generation_lock.release()
+                raise InterruptedError('Generation was interrupted before starting.')
 
     with models._generation_count_lock:
         models.active_generation_count += 1
 
     try:
-        for result in _generate_reply(*args, **kwargs):
-            yield result
+        yield from _generate_reply(*args, **kwargs)
     finally:
         with models._generation_count_lock:
             models.active_generation_count -= 1
@@ -45,6 +55,9 @@ def generate_reply(*args, **kwargs):
 
 
 def _generate_reply(question, state, stopping_strings=None, is_chat=False, escape_html=False, for_ui=False):
+    rewrite_guard = state.get('_rewrite_generation_guard', False)
+    rewrite_stop = state.get('_rewrite_stop_predicate') if rewrite_guard else None
+    rewrite_event = state.get('stop_event') if rewrite_guard else None
     # Find the appropriate generation function
     generate_func = apply_extensions('custom_generate_reply')
     if generate_func is None:
@@ -67,6 +80,16 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
     if not is_chat:
         state = apply_extensions('state', state)
         question = apply_extensions('input', question, state)
+    if rewrite_guard:
+        state = dict(state)
+        state['_rewrite_generation_guard'] = True
+        state['_rewrite_stop_predicate'] = rewrite_stop
+        if rewrite_event is not None:
+            state['stop_event'] = rewrite_event
+        state['skip_special_tokens'] = False
+        state['auto_max_new_tokens'] = False
+        state['stream'] = True
+        validate_rewrite_prompt(question, state)
 
     # Find the stopping strings
     all_stop_strings = []
@@ -93,39 +116,70 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
     # Generate
     last_update = -1
     latency_threshold = 1 / 1000
-    for reply in generate_func(question, original_question, state, stopping_strings, is_chat=is_chat):
-        cur_time = time.monotonic()
-        reply, stop_found = apply_stopping_strings(reply, all_stop_strings)
-        if escape_html:
-            reply = html.escape(reply)
+    generated = generate_func(question, original_question, state, stopping_strings, is_chat=is_chat)
+    try:
+        for reply in generated:
+            cur_time = time.monotonic()
+            reply, stop_found = apply_stopping_strings(reply, all_stop_strings)
+            if escape_html:
+                reply = html.escape(reply)
+            if rewrite_stop is not None and rewrite_stop(reply):
+                break
 
-        if is_stream:
-            # Limit number of tokens/second to make text readable in real time
-            if state['max_tokens_second'] > 0:
-                diff = 1 / state['max_tokens_second'] - (cur_time - last_update)
-                if diff > 0:
-                    time.sleep(diff)
+            if is_stream:
+                # Limit number of tokens/second to make text readable in real time
+                if state['max_tokens_second'] > 0:
+                    diff = 1 / state['max_tokens_second'] - (cur_time - last_update)
+                    if diff > 0:
+                        time.sleep(diff)
 
-                last_update = time.monotonic()
-                yield reply
-
-            # Limit updates to avoid lag in the Gradio UI
-            # API updates are not limited
-            else:
-                # If 'generate_func' takes less than 0.001 seconds to yield the next token
-                # (equivalent to more than 1000 tok/s), assume that the UI is lagging behind and skip yielding
-                if (cur_time - last_update) > latency_threshold:
+                    last_update = time.monotonic()
                     yield reply
-                last_update = time.monotonic()
 
-        stop_event = state.get('stop_event')
-        if stop_found or shared.stop_everything or (stop_event and stop_event.is_set()):
-            break
+                # Limit updates to avoid lag in the Gradio UI
+                # API updates are not limited
+                else:
+                    # If 'generate_func' takes less than 0.001 seconds to yield the next token
+                    # (equivalent to more than 1000 tok/s), assume that the UI is lagging behind and skip yielding
+                    if (cur_time - last_update) > latency_threshold:
+                        yield reply
+                    last_update = time.monotonic()
+
+            stop_event = state.get('stop_event')
+            if stop_found or shared.stop_everything or (stop_event and stop_event.is_set()):
+                break
+    finally:
+        close = getattr(generated, 'close', None)
+        if close is not None:
+            close()
 
     if not is_chat:
         reply = apply_extensions('output', reply, state)
 
     yield reply
+
+
+def validate_rewrite_prompt(question, state, input_ids=None, inputs_embeds=None, original_budget=None):
+    """Opt-in no-truncation guard after extension transformations."""
+    budget = get_max_prompt_length(state)
+    if original_budget is not None:
+        budget = min(budget, original_budget)
+    if input_ids is None and inputs_embeds is None:
+        count = len(encode(question, add_bos_token=state['add_bos_token'])[0])
+    else:
+        lengths = []
+        if input_ids is not None:
+            lengths.append(int(input_ids.shape[-1]))
+        if inputs_embeds is not None:
+            lengths.append(int(inputs_embeds.shape[-2]))
+        count = max(lengths)
+    if budget <= 0 or count > budget:
+        raise ValueError(
+            f'Sentence rewrite prompt requires {count} tokens after extension hooks; '
+            f'only {budget} prompt tokens are available. References will not be '
+            'silently truncated. Reduce K/window size or increase the context limit.'
+        )
+    return count
 
 
 def encode(prompt, add_special_tokens=True, add_bos_token=True, truncation_length=None):
@@ -321,7 +375,8 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
     from modules.torch_utils import clear_torch_cache, get_device
     from modules.transformers_loader import (
         Stream,
-        _StopEverythingStoppingCriteria
+        _StopEverythingStoppingCriteria,
+        get_eos_token_ids
     )
 
     if shared.args.loader == 'Transformers':
@@ -378,8 +433,12 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
     if state['prompt_lookup_num_tokens'] > 0:
         generate_params['prompt_lookup_num_tokens'] = state['prompt_lookup_num_tokens']
 
+    eos_token_ids = get_eos_token_ids(shared.model, shared.tokenizer)
     if state['ban_eos_token']:
-        generate_params['suppress_tokens'] = [shared.tokenizer.eos_token_id]
+        if getattr(getattr(shared.model, 'config', None), 'model_type', None) == 'gemma4_unified':
+            generate_params['suppress_tokens'] = list(eos_token_ids)
+        else:
+            generate_params['suppress_tokens'] = [shared.tokenizer.eos_token_id]
 
     if state['static_cache']:
         generate_params['cache_implementation'] = 'static'
@@ -403,7 +462,10 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
     generate_params.update({'use_cache': not shared.args.no_cache})
 
     # Encode the input
-    input_ids = encode(question, add_bos_token=state['add_bos_token'], truncation_length=get_max_prompt_length(state))
+    rewrite_guard = state.get('_rewrite_generation_guard', False)
+    rewrite_budget = get_max_prompt_length(state) if rewrite_guard else None
+    input_ids = encode(question, add_bos_token=state['add_bos_token'],
+                       truncation_length=None if rewrite_guard else get_max_prompt_length(state))
     output = input_ids[0]
     shared.model.last_prompt_token_count = input_ids.shape[-1]
     shared.model.last_completion_token_count = 0
@@ -412,16 +474,21 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
 
     # Add the encoded tokens to generate_params
     question, input_ids, inputs_embeds = apply_extensions('tokenizer', state, question, input_ids, None)
+    if rewrite_guard:
+        state['_rewrite_generation_guard'] = True
+        state['skip_special_tokens'] = False
+        shared.model.last_prompt_token_count = validate_rewrite_prompt(
+            question, state, input_ids, inputs_embeds, original_budget=rewrite_budget,
+        )
     original_input_ids = input_ids
     generate_params.update({'inputs': input_ids})
     if inputs_embeds is not None:
         generate_params.update({'inputs_embeds': inputs_embeds})
 
     # Stopping criteria / eos token
-    eos_token_ids = [shared.tokenizer.eos_token_id] if shared.tokenizer.eos_token_id is not None else []
     generate_params['eos_token_id'] = eos_token_ids
     generate_params['stopping_criteria'] = transformers.StoppingCriteriaList()
-    generate_params['stopping_criteria'].append(_StopEverythingStoppingCriteria())
+    generate_params['stopping_criteria'].append(_StopEverythingStoppingCriteria(state.get('stop_event')))
 
     # Logits processor
     processor = state.get('logits_processor', LogitsProcessorList([]))
@@ -523,8 +590,14 @@ def generate_reply_custom(question, original_question, state, stopping_strings=N
             reply = shared.model.generate(question, state)
             yield reply
         else:
-            for reply in shared.model.generate_with_streaming(question, state):
-                yield reply
+            model_stream = shared.model.generate_with_streaming(question, state)
+            try:
+                for reply in model_stream:
+                    yield reply
+            finally:
+                close = getattr(model_stream, 'close', None)
+                if close is not None:
+                    close()
 
     except Exception:
         logger.exception("Failed to generate reply (custom)")

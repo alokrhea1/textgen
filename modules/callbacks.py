@@ -1,5 +1,5 @@
 from queue import Queue
-from threading import Thread
+from threading import Thread, current_thread
 
 import modules.shared as shared
 from modules.logging_colors import logger
@@ -65,3 +65,8 @@ class Iteratorize:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop_now = True
+        # A stopped consumer must not release the generation lock while the
+        # model worker still uses it. The next callback raises StopNowException;
+        # wait for that worker to leave generation before returning to the caller.
+        if self.thread is not current_thread():
+            self.thread.join()

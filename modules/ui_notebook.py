@@ -4,7 +4,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from modules import logits, shared, ui, utils
+from modules import logits, shared, ui, ui_sentence_rewrite, utils
 from modules.prompts import count_tokens, load_prompt
 from modules.text_generation import (
     generate_reply_wrapper,
@@ -55,6 +55,8 @@ def create_ui():
                     shared.gradio['get_tokens-notebook'] = gr.Button('Get token IDs for the input')
                     shared.gradio['tokens-notebook'] = gr.Textbox(lines=23, label='Tokens', elem_classes=['textbox_logits_notebook', 'add_scrollbar', 'monospace'])
 
+                ui_sentence_rewrite.create_ui('notebook')
+
                 with gr.Row():
                     shared.gradio['Undo'] = gr.Button('Undo', elem_classes='small-button')
                     shared.gradio['Regenerate-notebook'] = gr.Button('Regenerate', elem_classes='small-button')
@@ -81,6 +83,7 @@ def create_ui():
 
 
 def create_event_handlers():
+    ui_sentence_rewrite.create_event_handlers('notebook')
     shared.gradio['Generate-notebook'].click(
         lambda x: x, gradio('textbox-notebook'), gradio('last_input-notebook')).then(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from modules import logits, shared, ui, utils
+from modules import logits, shared, ui, ui_sentence_rewrite, utils
 from modules.prompts import count_tokens, load_prompt
 from modules.text_generation import (
     generate_reply_wrapper,
@@ -72,8 +72,11 @@ def create_ui():
                     shared.gradio['get_tokens-default'] = gr.Button('Get token IDs for the input')
                     shared.gradio['tokens-default'] = gr.Textbox(lines=23, label='Tokens', elem_classes=['textbox_logits', 'add_scrollbar', 'monospace'])
 
+                ui_sentence_rewrite.create_ui('default')
+
 
 def create_event_handlers():
+    ui_sentence_rewrite.create_event_handlers('default')
     shared.gradio['Generate-default'].click(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
         lambda: [gr.update(visible=True), gr.update(visible=False)], None, gradio('Stop-default', 'Generate-default')).then(

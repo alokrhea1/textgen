@@ -51,16 +51,18 @@ class TensorRTLLMModel:
         result = self.llm.generate_async(prompt, sampling_params=sampling_params, streaming=True)
 
         cumulative_reply = ''
-        for output in result:
-            if shared.stop_everything or (stop_event and stop_event.is_set()):
-                result.abort()
-                break
+        try:
+            for output in result:
+                if shared.stop_everything or (stop_event and stop_event.is_set()):
+                    break
 
-            self.last_completion_token_count = len(output.outputs[0].token_ids)
-            text_diff = output.outputs[0].text_diff
-            if text_diff:
-                cumulative_reply += text_diff
-                yield cumulative_reply
+                self.last_completion_token_count = len(output.outputs[0].token_ids)
+                text_diff = output.outputs[0].text_diff
+                if text_diff:
+                    cumulative_reply += text_diff
+                    yield cumulative_reply
+        finally:
+            result.abort()
 
     def generate(self, prompt, state):
         output = ''

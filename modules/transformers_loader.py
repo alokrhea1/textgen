@@ -25,11 +25,12 @@ transformers.logging.set_verbosity_error()
 
 
 class _StopEverythingStoppingCriteria(transformers.StoppingCriteria):
-    def __init__(self):
+    def __init__(self, stop_event=None):
         transformers.StoppingCriteria.__init__(self)
+        self.stop_event = stop_event
 
     def __call__(self, input_ids: torch.LongTensor, _scores: torch.FloatTensor) -> bool:
-        return shared.stop_everything
+        return shared.stop_everything or (self.stop_event is not None and self.stop_event.is_set())
 
 
 class Stream(transformers.StoppingCriteria):
@@ -102,6 +103,17 @@ def load_tokenizer(model_name, tokenizer_dir=None):
     return tokenizer
 
 
+def get_eos_token_ids(model, tokenizer):
+    """Keep Gemma 4's checkpoint turn terminator alongside tokenizer EOS."""
+    ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
+    if getattr(getattr(model, 'config', None), 'model_type', None) == 'gemma4_unified':
+        configured = getattr(getattr(model, 'generation_config', None), 'eos_token_id', None)
+        if configured is not None:
+            configured = configured if isinstance(configured, (list, tuple)) else [configured]
+            ids.extend(configured)
+    return list(dict.fromkeys(ids))
+
+
 def load_model_HF(model_name):
     torch._dynamo.config.disable = True
 
@@ -130,7 +142,16 @@ def load_model_HF(model_name):
         else:
             params['torch_dtype'] = torch.float16
 
-    if 'chatglm' in model_name.lower():
+    if getattr(config, 'model_type', None) == 'gemma4_unified':
+        # This is a decoder-only multimodal model; its full checkpoint needs
+        # the conditional-generation head rather than the text-only auto class.
+        try:
+            from transformers import AutoModelForMultimodalLM
+        except ImportError as exc:
+            raise ImportError('Gemma 4 unified requires a Transformers version with AutoModelForMultimodalLM and gemma4_unified support.') from exc
+        LoaderClass = AutoModelForMultimodalLM
+        shared.is_seq2seq = False
+    elif 'chatglm' in model_name.lower():
         LoaderClass = AutoModel
     else:
         if config.to_dict().get('is_encoder_decoder', False):

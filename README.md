@@ -462,6 +462,8 @@ To pass extra flags, put each on its own line:
 
 https://github.com/oobabooga/textgen/wiki
 
+[Notebook sentence rewriting](docs/Notebook-Rewrite.md): manual local-corpus retrieval, model setup, and rewrite controls.
+
 ## Community
 
 [![Reddit](https://img.shields.io/reddit/subreddit-subscribers/Oobabooga?style=for-the-badge&logo=reddit&logoColor=white&label=r%2FOobabooga&labelColor=black&color=FF4500)](https://www.reddit.com/r/Oobabooga/)
