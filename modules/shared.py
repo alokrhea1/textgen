@@ -141,6 +141,10 @@ group.add_argument('--enable-tp', '--enable_tp', action='store_true', help='Enab
 group.add_argument('--tp-backend', type=str, default='native', help='The backend for tensor parallelism. Valid options: native, nccl. Default: native.')
 group.add_argument('--cfg-cache', action='store_true', help='Create an additional cache for CFG negative prompts. Necessary to use CFG with that loader.')
 
+# TensorRT-LLM
+group = parser.add_argument_group('TensorRT-LLM')
+group.add_argument('--tensorrt-llm-python', type=str, default=None, help='Python executable in an isolated TensorRT-LLM runtime. Defaults to user_data/tensorrt_runtime/bin/python when installed.')
+
 # Gradio
 group = parser.add_argument_group('Gradio')
 group.add_argument('--listen', action='store_true', help='Make the web UI reachable from your local network.')

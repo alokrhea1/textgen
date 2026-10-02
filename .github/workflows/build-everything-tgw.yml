@@ -81,7 +81,8 @@ jobs:
     uses: ./.github/workflows/build-portable-release.yml
     with:
       version: ${{ inputs.version }}
-      config: 'os:macos-15-intel,macos-14'
+      # Current PyTorch/Python wheels support Apple Silicon macOS only.
+      config: 'os:macos-14'
 
   build_release_ik_cuda_windows:
     name: ik CUDA Windows

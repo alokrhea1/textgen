@@ -1,0 +1,4 @@
+# Shared Rewrite dependencies. Torch remains selected by the installation profile.
+sentence-transformers==6.1.0
+sentencepiece==0.2.1
+protobuf==6.33.5

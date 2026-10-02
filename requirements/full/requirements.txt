@@ -1,3 +1,4 @@
+-r ../rewrite-common.txt
 accelerate==1.13.*
 audioop-lts<1.0; python_version >= "3.13"
 bitsandbytes==0.49.*
@@ -23,7 +24,6 @@ requests
 rich
 safetensors==0.7.*
 scipy
-sentencepiece
 tensorboard
 torchao==0.15.*
 trafilatura==2.0.0

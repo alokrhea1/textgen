@@ -2,7 +2,8 @@ version: "3.3"
 services:
   textgen:
     build:
-      context: .
+      context: ../..
+      dockerfile: docker/nvidia/Dockerfile
       args:
         # specify which cuda version your card supports: https://developer.nvidia.com/cuda-gpus
         TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.6;8.9+PTX}

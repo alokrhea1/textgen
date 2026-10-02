@@ -89,6 +89,7 @@ def score_many(query: np.ndarray, documents: list[np.ndarray],
                scoring: str = "symmetric", device: str = "cpu") -> list[float]:
     """Exact token matching on CPU or bounded float32 CUDA batches.
 
+    MPS embedding/reranking uses this exact CPU matching path.
     Symmetric inputs must both use document-role encoding. Padding never
     participates in maxima, including when every genuine match is negative.
     """
@@ -101,7 +102,7 @@ def score_many(query: np.ndarray, documents: list[np.ndarray],
     if not matrices:
         return []
     reverse = scoring == "symmetric"
-    if device == "cpu":
+    if device == "cpu" or device == "mps" or device.startswith("mps:"):
         results = []
         for document in matrices:
             forward, backward = _token_maxima(normalized_query, document, reverse=reverse)

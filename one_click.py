@@ -1,6 +1,7 @@
 import argparse
 import glob
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -12,6 +13,7 @@ import sys
 
 # Define the required versions
 TORCH_VERSION = "2.9.0"
+ROCM_TORCH_VERSION = "2.9.1"
 PYTHON_VERSION = "3.13"
 LIBSTDCXX_VERSION_LINUX = "12.1.0"
 
@@ -91,7 +93,7 @@ def get_gpu_choice():
                 "What is your GPU?",
                 {
                     'A': 'NVIDIA',
-                    'B': 'AMD - Linux only, ROCm 7.2',
+                    'B': 'AMD - ROCm 7.2 (Windows: CPU PyTorch, AMD GGUF)',
                     'C': 'Apple M Series',
                     'D': 'Intel Arc (beta)',
                     'N': 'CPU mode'
@@ -115,9 +117,11 @@ def get_pytorch_install_command(gpu_choice):
 
     if gpu_choice == "NVIDIA_CUDA128":
         return base_cmd + "--index-url https://download.pytorch.org/whl/cu128" + pypi_fallback
+    elif gpu_choice == "AMD" and is_windows():
+        return base_cmd + "--index-url https://download.pytorch.org/whl/cpu" + pypi_fallback
     elif gpu_choice == "AMD":
         py_tag = f"cp{PYTHON_VERSION.replace('.', '')}"
-        return f"python -m pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-{TORCH_VERSION}%2Brocm7.2.0.lw.git7e1940d4-{py_tag}-{py_tag}-linux_x86_64.whl --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/"
+        return f"python -m pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-{ROCM_TORCH_VERSION}%2Brocm7.2.0.lw.git7e1940d4-{py_tag}-{py_tag}-linux_x86_64.whl --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/"
     elif gpu_choice in ["APPLE", "NONE"]:
         return base_cmd + "--index-url https://download.pytorch.org/whl/cpu" + pypi_fallback
     elif gpu_choice == "INTEL":
@@ -133,9 +137,11 @@ def get_pytorch_update_command(gpu_choice):
 
     if gpu_choice == "NVIDIA_CUDA128":
         return f"{base_cmd}--index-url https://download.pytorch.org/whl/cu128" + pypi_fallback
+    elif gpu_choice == "AMD" and is_windows():
+        return base_cmd + "--index-url https://download.pytorch.org/whl/cpu" + pypi_fallback
     elif gpu_choice == "AMD":
         py_tag = f"cp{PYTHON_VERSION.replace('.', '')}"
-        return f"python -m pip install --upgrade https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-{TORCH_VERSION}%2Brocm7.2.0.lw.git7e1940d4-{py_tag}-{py_tag}-linux_x86_64.whl --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/"
+        return f"python -m pip install --upgrade https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-{ROCM_TORCH_VERSION}%2Brocm7.2.0.lw.git7e1940d4-{py_tag}-{py_tag}-linux_x86_64.whl --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/"
     elif gpu_choice in ["APPLE", "NONE"]:
         return f"{base_cmd}--index-url https://download.pytorch.org/whl/cpu" + pypi_fallback
     elif gpu_choice == "INTEL":
@@ -144,8 +150,19 @@ def get_pytorch_update_command(gpu_choice):
         return base_cmd
 
 
+def check_supported_platform():
+    if is_macos() and is_x86_64():
+        raise SystemExit(
+            "Native macOS Intel installations are unsupported by the current Rewrite stack: "
+            "Transformers requires PyTorch >= 2.4, but macOS Intel wheels stop at 2.2.2. "
+            "Use Linux on this machine with the CPU-only profile, or an Apple Silicon Mac. "
+            "The retained requirements_apple_intel.txt files are legacy references."
+        )
+
+
 def get_requirements_file(gpu_choice):
     """Get requirements file path based on GPU choice"""
+    check_supported_platform()
     requirements_base = os.path.join("requirements", "full")
 
     if gpu_choice == "NVIDIA_CUDA128":
@@ -163,6 +180,8 @@ def get_requirements_file(gpu_choice):
 
 
 def get_current_commit():
+    if not os.path.exists(os.path.join(script_dir, ".git")):
+        return "source-archive"
     result = run_cmd("git rev-parse HEAD", capture_output=True, environment=True)
     return result.stdout.decode('utf-8').strip()
 
@@ -288,6 +307,7 @@ def clean_outdated_pytorch_cuda_dependencies():
 
 
 def install_webui():
+    check_supported_platform()
     if os.path.isfile(state_file):
         os.remove(state_file)
 
@@ -306,10 +326,10 @@ def install_webui():
     elif any((is_windows(), is_linux())) and gpu_choice == "NVIDIA_CUDA128":
         print("CUDA: 12.8")
 
-    # No PyTorch for AMD on Windows
+    # GGUF keeps its ROCm backend; this PyTorch distribution supports Linux only.
     elif is_windows() and gpu_choice == "AMD":
-        print("PyTorch setup on Windows is not implemented yet. Exiting...")
-        sys.exit(1)
+        print("Installing CPU PyTorch for Windows AMD retrieval and Transformers. "
+              "GGUF generation retains the AMD backend.")
 
     # Install Git and then Pytorch
     print_big_message("Installing PyTorch.")
@@ -320,20 +340,82 @@ def install_webui():
     update_requirements(initial_installation=True, pull=False)
 
 
+def read_requirements(path, seen=None):
+    """Flatten includes before copying to the root-level temporary pip file."""
+    path = os.path.abspath(path)
+    seen = set() if seen is None else seen
+    if path in seen:
+        raise ValueError(f"Circular requirements include: {path}")
+    seen.add(path)
+    lines = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle.read().splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("-r ", "--requirement ")):
+                included = stripped.split(None, 1)[1]
+                lines.extend(read_requirements(os.path.join(os.path.dirname(path), included), seen))
+            else:
+                lines.append(line)
+    seen.remove(path)
+    return lines
+
+
+def update_repository():
+    """Keep a fork on its configured branch; release tags apply only upstream."""
+    origin = run_cmd("git remote get-url origin", capture_output=True, environment=True).stdout.decode().strip()
+    upstream = origin.rstrip("/").removesuffix(".git") in {
+        "https://github.com/oobabooga/textgen",
+        "https://github.com/oobabooga/text-generation-webui",
+        "git@github.com:oobabooga/textgen",
+        "git@github.com:oobabooga/text-generation-webui",
+    }
+    if not upstream:
+        print_big_message("Updating the configured fork branch.")
+        run_cmd("git pull --autostash --ff-only", assert_success=True, environment=True)
+        return
+    run_cmd("git fetch origin --tags", assert_success=True, environment=True)
+    latest_tag = run_cmd('git tag -l "v*" --sort=-v:refname', capture_output=True, environment=True).stdout.decode().strip().split('\n', 1)[0]
+    if latest_tag and run_cmd(f"git merge-base --is-ancestor HEAD {latest_tag}", capture_output=True, environment=True).returncode == 0:
+        print_big_message(f'Updating to release tag {latest_tag}.')
+        run_cmd(f"git merge --autostash --ff-only {latest_tag}", assert_success=True, environment=True)
+    else:
+        print_big_message(f'HEAD is ahead of the latest release tag ({latest_tag}). Skipping git update.')
+
+
+def select_rewrite_requirements(lines, state):
+    """Preserve only the explicitly supported Gemma override, not arbitrary versions."""
+    selection = os.environ.get("REWRITE_GEMMA4", "").lower()
+    if selection:
+        enabled = selection in ("yes", "y", "true", "1", "t", "on")
+    elif state.get("rewrite_gemma4"):
+        enabled = True
+    else:
+        try:
+            enabled = importlib.metadata.version("transformers") == "5.10.4"
+        except importlib.metadata.PackageNotFoundError:
+            enabled = False
+    state["rewrite_gemma4"] = enabled
+    if enabled:
+        print_big_message("Preserving the Gemma 4 Transformers 5.10.4 override.")
+        lines = ["transformers==5.10.4" if line == "transformers==5.6.*" else line for line in lines]
+    return lines
+
+
+def preserve_rewrite_selection():
+    # Capture a manually installed Gemma override before extension pip commands
+    # can replace Transformers and erase evidence of the selected profile.
+    state = load_state()
+    select_rewrite_requirements([], state)
+    save_state(state)
+
+
 def update_requirements(initial_installation=False, pull=True):
-    # Create .git directory if missing
+    check_supported_platform()
+    # Source archives carry no origin metadata. Never overwrite their custom code.
     if not os.path.exists(os.path.join(script_dir, ".git")):
-        run_cmd(
-            "git init -b main && git remote add origin https://github.com/oobabooga/textgen && "
-            "git fetch && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main && "
-            "git reset --hard origin/main && git branch --set-upstream-to=origin/main",
-            environment=True,
-            assert_success=True
-        )
-        # Land fresh installs on the latest release tag rather than bleeding-edge main.
-        latest_tag = run_cmd('git tag -l "v*" --sort=-v:refname', capture_output=True, environment=True).stdout.decode().strip().split('\n', 1)[0]
-        if latest_tag:
-            run_cmd(f"git reset --hard {latest_tag}", assert_success=True, environment=True)
+        print_big_message("Source archive: installing dependencies without replacing application files. "
+                          "Use a git clone of your fork for automatic code updates.")
+        pull = False
 
     # Check for outdated Python version and refuse to update
     if '.'.join(map(str, sys.version_info[:2])) != PYTHON_VERSION:
@@ -387,15 +469,7 @@ def update_requirements(initial_installation=False, pull=True):
         ]
         before_hashes = {file: calculate_file_hash(file) for file in files_to_check}
 
-        # Update to the latest release tag, but only if HEAD is an ancestor of it.
-        # This keeps users on untagged commits ahead of the last tag in place until the next release.
-        run_cmd("git fetch --tags", assert_success=True, environment=True)
-        latest_tag = run_cmd('git tag -l "v*" --sort=-v:refname', capture_output=True, environment=True).stdout.decode().strip().split('\n', 1)[0]
-        if latest_tag and run_cmd(f"git merge-base --is-ancestor HEAD {latest_tag}", capture_output=True, environment=True).returncode == 0:
-            print_big_message(f'Updating to release tag {latest_tag}.')
-            run_cmd(f"git merge --autostash --ff-only {latest_tag}", assert_success=True, environment=True)
-        else:
-            print_big_message(f'HEAD is ahead of the latest release tag ({latest_tag}). Skipping git update.')
+        update_repository()
         current_commit = get_current_commit()
 
         # Check hashes after pulling
@@ -419,6 +493,8 @@ def update_requirements(initial_installation=False, pull=True):
                 save_state(state)
                 sys.exit(1)
 
+    select_rewrite_requirements([], state)
+
     if os.environ.get("INSTALL_EXTENSIONS", "").lower() in ("yes", "y", "true", "1", "t", "on"):
         install_extensions_requirements()
 
@@ -434,7 +510,8 @@ def update_requirements(initial_installation=False, pull=True):
     print(f"GPU Choice: {gpu_choice}\n")
 
     # Prepare the requirements file
-    textgen_requirements = open(requirements_file).read().splitlines()
+    textgen_requirements = select_rewrite_requirements(read_requirements(requirements_file), state)
+    rewrite_gemma4 = state["rewrite_gemma4"]
     all_whl_lines = [line.strip() for line in textgen_requirements if '.whl' in line]
 
     if not initial_installation:
@@ -465,6 +542,7 @@ def update_requirements(initial_installation=False, pull=True):
     state = load_state()
     state['last_installed_commit'] = current_commit
     state['installed_wheels'] = all_whl_lines
+    state['rewrite_gemma4'] = rewrite_gemma4
     state.pop('wheels_changed', None)
     save_state(state)
 
@@ -474,6 +552,7 @@ def update_requirements(initial_installation=False, pull=True):
 
 
 def install_extensions_requirements():
+    preserve_rewrite_selection()
     print_big_message("Installing extensions requirements.\nSome of these may fail on Windows.\nDon\'t worry if you see error messages, as they will not affect the main program.")
     extensions = get_extensions_names()
     for i, extension in enumerate(extensions):
@@ -509,6 +588,7 @@ if __name__ == "__main__":
             if choice == 'A':
                 update_requirements()
             elif choice == 'B':
+                preserve_rewrite_selection()
                 choices = {'A': 'All extensions'}
                 for i, name in enumerate(get_extensions_names()):
                     key = generate_alphabetic_sequence(i + 1)

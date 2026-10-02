@@ -10,7 +10,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,rw \
     apt install --no-install-recommends -y git vim build-essential python3-dev pip bash curl && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /home/app/
-RUN git clone https://github.com/oobabooga/textgen.git 
+COPY . /home/app/textgen
+RUN mkdir -p /home/app/textgen/user_data && touch /home/app/textgen/user_data/CMD_FLAGS.txt
 WORKDIR /home/app/textgen
 RUN GPU_CHOICE=B LAUNCH_AFTER_INSTALL=FALSE INSTALL_EXTENSIONS=TRUE ./start_linux.sh --verbose
 EXPOSE ${CONTAINER_PORT:-7860} ${CONTAINER_API_PORT:-5000}

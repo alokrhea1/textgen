@@ -10,9 +10,9 @@
 
 Download, unzip, double-click `textgen`. A window opens.
 
-**https://github.com/oobabooga/textgen/releases**
+**https://github.com/alokrhea1/textgen/releases**
 
-Portable builds for Linux, Windows, and macOS with CUDA, Vulkan, ROCm, and CPU-only options. All dependencies included. Compatible with GGUF (llama.cpp) models.
+Portable builds for Linux, Windows, and macOS with CUDA, Vulkan, ROCm, and CPU-only options. All dependencies included. For Rewrite, use a portable artifact built from this fork. If a matching artifact has not been published yet, use the manual or one-click installation below; upstream release archives do not include this fork's changes. Compatible with GGUF (llama.cpp) models.
 
 For additional backends (ExLlamaV3, Transformers), training, image generation, and extensions, see [Installation](#installation).
 
@@ -75,15 +75,15 @@ These formats require the full installation (not the portable build).
 
 ## Installation
 
-For the desktop app, see the [portable builds](https://github.com/oobabooga/textgen/releases). The options below run the web UI in your browser instead.
+For the desktop app, see the [portable builds](https://github.com/alokrhea1/textgen/releases). The options below run the web UI in your browser instead.
 
 ### Manual portable install with venv
 
-Fast setup on any Python 3.9+:
+Use Python 3.10+ for Rewrite (the full installer uses Python 3.13). Supported native platforms are Linux, Windows, and Apple Silicon macOS. Native Intel macOS is unsupported: the current Transformers stack requires PyTorch >=2.4, while Intel macOS wheels stop at 2.2.2. Use Linux with the CPU profile on Intel Mac hardware. The retained `requirements_apple_intel.txt` files are legacy references. See the [official PyTorch wheel index](https://download.pytorch.org/whl/cpu/torch/).
 
 ```bash
 # Clone repository
-git clone https://github.com/oobabooga/textgen
+git clone https://github.com/alokrhea1/textgen
 cd textgen
 
 # Create virtual environment
@@ -105,6 +105,10 @@ python server.py --portable --api --auto-launch
 deactivate
 ```
 
+Rewrite dependencies are installed automatically by every portable and full requirements profile. Portable CUDA 12.4 profiles install CUDA 12.4 PyTorch 2.6; CUDA 13.1 profiles install CUDA 12.8 PyTorch 2.9, which works with CUDA 13.1-capable drivers. Linux AMD profiles install ROCm 7.2 PyTorch. Apple Silicon uses PyTorch with MPS. CPU and Vulkan profiles use CPU PyTorch because Rewrite has no PyTorch Vulkan backend. Windows AMD retrieval uses CPU because the bundled ROCm PyTorch distribution is Linux-only. These retrieval choices are independent of the GGUF generation backend. See [Notebook Rewrite](docs/Notebook-Rewrite.md).
+
+For Gemma 4 Unified, install `requirements/rewrite-gemma4.txt` after base dependencies in a separate environment. One-click updates preserve this exact Transformers 5.10.4 override and record the selection; `REWRITE_GEMMA4=1` explicitly enables it and `REWRITE_GEMMA4=0` restores the normal pin. Manual requirements reinstalls require reapplying the Gemma override. Model weights download separately when first used.
+
 ### Full installation
 
 For users who need additional backends (ExLlamaV3, Transformers), training, image generation, or extensions like TTS, voice input, and translation. Requires ~10GB disk space and downloads PyTorch.
@@ -114,7 +118,7 @@ For users who need additional backends (ExLlamaV3, Transformers), training, imag
 
 ### One-click installer
 
-1. Clone the repository, or [download its source code](https://github.com/oobabooga/textgen/archive/refs/heads/main.zip) and extract it.
+1. Clone this fork, or download its source archive and extract it. Use your fork URL when cloning so updates retain its changes.
 2. Run the startup script for your OS: `start_windows.bat`, `start_linux.sh`, or `start_macos.sh`.
 3. When prompted, select your GPU vendor.
 4. After installation, open `http://127.0.0.1:7860` in your browser.
@@ -123,7 +127,7 @@ After installation:
 
 * **Restart**: run the same `start_` script.
 * **Pass command-line flags**: directly (e.g., `./start_linux.sh --help`), or persist them in `user_data/CMD_FLAGS.txt` (e.g., `--api` to enable the API).
-* **Update**: run the update script for your OS (`update_wizard_windows.bat`, `update_wizard_linux.sh`, or `update_wizard_macos.sh`).
+* **Update**: run the update script for your OS (`update_wizard_windows.bat`, `update_wizard_linux.sh`, or `update_wizard_macos.sh`). Fork clones fast-forward their configured tracking branch and preserve the origin URL. Source archives install/update dependencies without replacing application files; download a newer archive or clone your fork for code updates.
 * **Reinstall from scratch**: delete the `installer_files` folder and run the `start_` script again.
 * **Install extension requirements**: use the update wizard's "Install/update extensions requirements" option. It reinstalls the main project requirements at the end to ensure they take precedence over conflicting extension dependencies.
 
@@ -159,12 +163,12 @@ conda activate textgen
 
 | System | GPU | Command |
 |--------|---------|---------|
-| Linux/WSL | NVIDIA | `pip3 install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128` |
-| Linux/WSL | CPU only | `pip3 install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu` |
-| Linux | AMD | `pip3 install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp313-cp313-linux_x86_64.whl` |
-| MacOS + MPS | Any | `pip3 install torch==2.9.1` |
-| Windows | NVIDIA | `pip3 install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128` |
-| Windows | CPU only | `pip3 install torch==2.9.1` |
+| Linux/WSL | NVIDIA | `pip3 install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128` |
+| Linux/WSL | CPU only | `pip3 install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu` |
+| Linux | AMD | `pip3 install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp313-cp313-linux_x86_64.whl --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/` |
+| MacOS + MPS | Any | `pip3 install torch==2.9.0` |
+| Windows | NVIDIA | `pip3 install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128` |
+| Windows | CPU only / AMD retrieval | `pip3 install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu` |
 
 The up-to-date commands can be found here: https://pytorch.org/get-started/locally/.
 
@@ -177,7 +181,7 @@ conda install -y -c "nvidia/label/cuda-12.8.1" cuda
 #### 3. Install the web UI
 
 ```
-git clone https://github.com/oobabooga/textgen
+git clone https://github.com/alokrhea1/textgen
 cd textgen
 pip install -r requirements/full/<requirements file according to table below>
 ```
@@ -189,7 +193,7 @@ Requirements file to use:
 | NVIDIA | `requirements.txt` |
 | AMD | `requirements_amd.txt` |
 | CPU only | `requirements_cpu_only.txt` |
-| Apple Intel | `requirements_apple_intel.txt` |
+| Apple Intel | Unsupported natively; use Linux CPU (legacy file retained) |
 | Apple Silicon | `requirements_apple_silicon.txt` |
 
 #### 4. Start the web UI
@@ -218,29 +222,20 @@ pip install -r <requirements file that you have used> --upgrade
 
 ### Docker
 
-```
-For NVIDIA GPU:
-ln -s docker/{nvidia/Dockerfile,nvidia/docker-compose.yml,.dockerignore} .
-For AMD GPU:
-ln -s docker/{amd/Dockerfile,amd/docker-compose.yml,.dockerignore} .
-For Intel GPU:
-ln -s docker/{intel/Dockerfile,intel/docker-compose.yml,.dockerignore} .
-For CPU only
-ln -s docker/{cpu/Dockerfile,cpu/docker-compose.yml,.dockerignore} .
-cp docker/.env.example .env
-#Create logs/cache dir :
+Docker builds copy this checkout, including Rewrite and its automatic dependencies. Choose `nvidia`, `amd`, `intel`, or `cpu`:
+
+```bash
+cd docker/nvidia
+cp ../.env.example .env
+# Edit .env for ports and runtime user/group IDs.
 mkdir -p user_data/logs user_data/cache
-# Edit .env and set:
-#   TORCH_CUDA_ARCH_LIST based on your GPU model
-#   APP_RUNTIME_GID      your host user's group id (run `id -g` in a terminal)
-#   BUILD_EXTENIONS      optionally add comma separated list of extensions to build
-# Edit user_data/CMD_FLAGS.txt and add in it the options you want to execute (like --listen --cpu)
-#
 docker compose up --build
 ```
 
-* You need to have Docker Compose v2.17 or higher installed. See [this guide](https://github.com/oobabooga/textgen/wiki/09-%E2%80%90-Docker) for instructions.
-* For additional docker files, check out [this repository](https://github.com/Atinoda/text-generation-webui-docker).
+The Compose build context is the repository root. For TensorRT-LLM, build from the root with `docker build -f docker/TensorRT-LLM/Dockerfile -t textgen-trt .`. This image installs Rewrite in the webui environment and TensorRT-LLM in its separate worker environment, avoiding incompatible Transformers pins. See [Docker setup](docs/09%20-%20Docker.md) for hardware and persistence details.
+
+* Docker Compose v2.17 or higher is required.
+* NVIDIA images require NVIDIA Container Toolkit; AMD/Intel acceleration requires appropriate GPU device access and host drivers.
 
 </details>
 

@@ -221,7 +221,7 @@ def test_trt_early_close_aborts_async_result(native):
     native.stub('tensorrt_llm', __path__=[])
     native.stub('tensorrt_llm._tensorrt_engine', LLM=object)
     native.stub('tensorrt_llm.llmapi', SamplingParams=lambda **kwargs: kwargs)
-    native.shared.tokenizer = SimpleNamespace(encode=lambda prompt: [1, 2], eos_token_id=0)
+    native.shared.tokenizer = SimpleNamespace(encode=lambda prompt, **kwargs: [1, 2], eos_token_id=0)
     spec = importlib.util.spec_from_file_location(
         '_rewrite_test_trt', Path(__file__).parents[1] / 'modules' / 'tensorrt_llm.py',
     )
@@ -345,3 +345,109 @@ def test_gemma_ban_eos_suppresses_checkpoint_turn_terminator(native):
     assert list(native.generation.generate_reply_HF('prompt', 'prompt', state))[-1] == 'Sentence.'
     assert captured[0]['eos_token_id'] == [1, 106]
     assert captured[0]['suppress_tokens'] == [1, 106]
+
+
+@pytest.mark.parametrize('add_bos', [False, True])
+def test_rewrite_exllama_count_matches_native_special_tokens_and_bos(native, add_bos):
+    calls = []
+
+    class Exllamav3Model:
+        def encode_rewrite_prompt(self, prompt, state):
+            calls.append((prompt, state['add_bos_token']))
+            # A native special marker is one token rather than its text length.
+            return np.zeros((1, 2 + int(state['add_bos_token'])), dtype=np.int64)
+
+    native.shared.model = Exllamav3Model()
+    state = settings(add_bos_token=add_bos)
+    assert native.generation.get_rewrite_prompt_length('<think>x', state) == 2 + int(add_bos)
+    assert native.generation.validate_rewrite_prompt('<think>x', state) == 2 + int(add_bos)
+    assert calls == [('<think>x', add_bos)] * 2
+    assert not native.encodes
+
+
+def test_rewrite_planning_preserves_extension_count_but_guard_uses_native_tokens(native):
+    class Exllamav3Model:
+        def encode_rewrite_prompt(self, prompt, state):
+            return np.zeros((1, 30), dtype=np.int64)
+
+    native.shared.model = Exllamav3Model()
+    native.generation.apply_extensions = lambda kind, *args: 1 if kind == 'tokenized_length' else None
+    assert native.generation.get_rewrite_prompt_length('prompt', settings()) == 1
+    with pytest.raises(ValueError, match='requires 30 tokens'):
+        native.generation.validate_rewrite_prompt('prompt', settings())
+
+
+@pytest.mark.parametrize('add_bos', [False, True])
+def test_rewrite_trt_count_passes_bos_to_native_encoder(native, add_bos):
+    calls = []
+
+    class TensorRTLLMModel:
+        def encode_prompt(self, prompt, add_bos_token=True):
+            calls.append(add_bos_token)
+            return [1, 2] + ([3] if add_bos_token else [])
+
+    native.shared.model = TensorRTLLMModel()
+    assert native.generation.get_rewrite_prompt_length('prompt', settings(add_bos_token=add_bos)) == 2 + int(add_bos)
+    assert calls == [add_bos]
+
+
+@pytest.mark.parametrize('rewrite_guard', [False, True])
+def test_custom_native_error_reaches_rewrite_caller_only(native, rewrite_guard):
+    native.generation.set_manual_seed = lambda seed: seed
+    closed = []
+
+    class LlamaServer:
+        last_prompt_token_count = 3
+
+        def generate_with_streaming(self, prompt, state):
+            try:
+                raise ValueError('References will not be silently truncated: actual native input is too long')
+                yield ''
+            finally:
+                closed.append(True)
+
+    native.shared.model = LlamaServer()
+    generated = native.generation.generate_reply_custom(
+        'prompt', 'prompt', settings(seed=0, _rewrite_generation_guard=rewrite_guard),
+    )
+    if rewrite_guard:
+        with pytest.raises(ValueError, match='actual native input is too long'):
+            list(generated)
+    else:
+        assert list(generated) == ['']
+    assert closed == [True]
+
+
+@pytest.mark.parametrize('rewrite_guard', [False, True])
+def test_hf_runtime_error_reaches_rewrite_caller_only(native, rewrite_guard):
+    import ast
+    from contextlib import nullcontext
+    import time
+
+    source = (Path(__file__).parents[1] / 'modules' / 'text_generation.py').read_text()
+    function = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'generate_reply_HF')
+    # Exercise the actual backend generation/error cleanup block, independently
+    # of CUDA and Transformers setup performed before it.
+    block = next(node for node in function.body if isinstance(node, ast.Try))
+    wrapper = ast.FunctionDef(name='generate', args=ast.arguments(posonlyargs=[], args=[],
+                             kwonlyargs=[], kw_defaults=[], defaults=[]),
+                             body=[*ast.parse('output = []').body, block], decorator_list=[])
+    tree = ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[]))
+
+    def fail(**kwargs):
+        raise RuntimeError('HF runtime failed to allocate native cache')
+
+    native.shared.model = SimpleNamespace(generate=fail)
+    native.shared.is_seq2seq = False
+    namespace = dict(shared=native.shared, state={'stream': False}, is_chat=False,
+                     rewrite_guard=rewrite_guard, torch=SimpleNamespace(no_grad=nullcontext),
+                     generate_params={}, output=[], original_input_ids=[[1, 2]],
+                     time=time, t0=time.time(), seed=0, logger=native.generation.logger)
+    exec(compile(tree, '<HF runtime exception boundary>', 'exec'), namespace)
+    generated = namespace['generate']()
+    if rewrite_guard:
+        with pytest.raises(RuntimeError, match='native cache'):
+            list(generated)
+    else:
+        assert list(generated) == ['']

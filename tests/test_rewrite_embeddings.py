@@ -1,7 +1,8 @@
 """Model-free contracts. Intentionally not executed during implementation."""
 import unittest
 import os
-from unittest.mock import Mock
+import sys
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -20,6 +21,16 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(score_many(query, []), [])
         with self.assertRaises(ValueError):
             score_many(query, documents, "pooled")
+
+    def test_mps_embedding_device_uses_exact_cpu_scoring_without_torch(self):
+        query = np.array([[2., 0.], [1., 1.]])
+        documents = [np.array([[1., 0.]]), np.array([[-1., 0.], [0., -1.]])]
+        for mode in ["directional", "symmetric"]:
+            expected = score_many(query, documents, mode, "cpu")
+            with patch.dict(sys.modules, {"torch": None}):
+                for device in ["mps", "mps:0"]:
+                    np.testing.assert_allclose(score_many(query, documents, mode, device), expected, atol=1e-6)
+                self.assertEqual(score_many(query, [], mode, "mps"), [])
 
     @unittest.skipUnless(os.environ.get("REWRITE_TEST_CUDA") == "1", "Explicit CUDA scoring test opt-in")
     def test_cuda_ragged_padding_and_oversized_tiling(self):

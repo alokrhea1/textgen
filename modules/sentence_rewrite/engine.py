@@ -50,7 +50,7 @@ def _replacement_body(reply, reasoning_prefix=''):
 def prepare_prompt(notebook, span, hits, state, guidance='', use_template=True):
     """Keep every retrieved hit, reducing notebook context to fit native tokens."""
     from modules import shared
-    from modules.text_generation import get_encoded_length, get_max_prompt_length
+    from modules.text_generation import get_rewrite_prompt_length, get_max_prompt_length
 
     # Validate the supplied offsets before putting their contents in a prompt.
     replace_sentence(notebook, span, span.text)
@@ -116,11 +116,11 @@ def prepare_prompt(notebook, span, hits, state, guidance='', use_template=True):
         return render(prefix[-before_count:] if before_count else '', suffix[:after_count])
 
     full = candidate(len(prefix) + len(suffix))
-    full_count = get_encoded_length(full)
+    full_count = get_rewrite_prompt_length(full, state)
     if full_count <= budget:
         return PromptPlan(full, hits, False, full_count)
     minimal = candidate(0)
-    minimum_count = get_encoded_length(minimal)
+    minimum_count = get_rewrite_prompt_length(minimal, state)
     if minimum_count > budget:
         raise ValueError(
             f'All {len(hits)} retrieved references and the selected sentence require '
@@ -132,7 +132,7 @@ def prepare_prompt(notebook, span, hits, state, guidance='', use_template=True):
     while low + 1 < high:
         mid = (low + high) // 2
         prompt = candidate(mid)
-        count = get_encoded_length(prompt)
+        count = get_rewrite_prompt_length(prompt, state)
         if count <= budget:
             low, best, best_count = mid, prompt, count
         else:

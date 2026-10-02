@@ -1,4 +1,3 @@
-# Native trained ColBERT loading; compatible with the webui Transformers 5.6 pin.
-sentence-transformers==6.1.0
-sentencepiece>=0.2,<1
-protobuf>=4.25,<8
+# Repair/add Rewrite to an existing environment; install hardware-specific Torch first.
+-r rewrite-common.txt
+transformers==5.6.*

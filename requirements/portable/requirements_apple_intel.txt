@@ -1,3 +1,9 @@
+# LEGACY REFERENCE ONLY: native macOS Intel cannot install the current Rewrite stack.
+# Transformers >=5.6 requires Torch >=2.4; official Intel macOS wheels stop at2.2.2.
+# Use Linux CPU on Intel hardware or native macOS on Apple Silicon; see README.
+-r ../rewrite-torch-cpu.txt
+transformers==5.6.*
+-r ../rewrite-common.txt
 audioop-lts<1.0; python_version >= "3.13"
 ddgs==9.14.1
 fastapi==0.112.4

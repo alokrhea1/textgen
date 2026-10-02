@@ -28,7 +28,7 @@ from modules.image_utils import (
     convert_openai_messages_to_images
 )
 from modules.logging_colors import logger
-from modules.text_generation import get_max_prompt_length
+from modules.text_generation import get_max_prompt_length, validate_rewrite_prompt
 
 try:
     import flash_attn
@@ -386,7 +386,12 @@ class Exllamav3Model:
             embeddings=image_embeddings,
         )
 
-        input_ids = input_ids[:, -get_max_prompt_length(state):]
+        if state.get('_rewrite_generation_guard', False):
+            # Validate the actual native input, including special tokens and any
+            # image embeddings, before the ordinary left-truncation step.
+            validate_rewrite_prompt(prompt, state, input_ids=input_ids)
+        else:
+            input_ids = input_ids[:, -get_max_prompt_length(state):]
 
         self._last_prompt_token_count = input_ids.shape[-1]
 
@@ -429,6 +434,9 @@ class Exllamav3Model:
         stop_event = state.get('stop_event')
         self.last_completion_probabilities = []
         self.last_completion_token_count = 0
+
+        if shared.stop_everything or (stop_event and stop_event.is_set()):
+            return
 
         result_queue = self.parallel_generator.submit(job)
         try:
@@ -540,6 +548,12 @@ class Exllamav3Model:
         if add_bos and self.tokenizer.bos_token and string.startswith(self.tokenizer.bos_token):
             add_bos = False
         return self.tokenizer.encode(string, add_bos=add_bos, **kwargs)
+
+    def encode_rewrite_prompt(self, prompt, state):
+        """Match native generation tokenization for the rewrite preflight."""
+        return self.tokenizer.encode(
+            prompt, add_bos=state['add_bos_token'], encode_special_tokens=True,
+        )
 
     def decode(self, ids, **kwargs):
         if isinstance(ids, torch.Tensor) and ids.dim() == 0:

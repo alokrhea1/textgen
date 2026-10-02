@@ -87,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          repository: 'oobabooga/textgen'
+          # Build this fork, including its native Rewrite modules.
           ref: ${{ inputs.version }}
           submodules: 'recursive'
 
@@ -98,10 +98,11 @@ jobs:
       - name: Build Package
         shell: bash
         run: |
+            set -euo pipefail
             VERSION_CLEAN="${{ inputs.version }}"
             VERSION_CLEAN="${VERSION_CLEAN#v}"
             cd ..
-            cp -r textgen "textgen-${VERSION_CLEAN}"
+            cp -r "$GITHUB_WORKSPACE" "textgen-${VERSION_CLEAN}"
             cd "textgen-${VERSION_CLEAN}"
 
             # Remove extensions that need additional requirements
@@ -129,18 +130,26 @@ jobs:
             # 2. Download and extract Python
             cd ..
             echo "Downloading Python for $PLATFORM..."
-            curl -L -o python-build.tar.gz "$PYTHON_URL"
+            curl --fail --location --retry 3 -o python-build.tar.gz "$PYTHON_URL"
             tar -xzf python-build.tar.gz
             mv python "textgen-${VERSION_CLEAN}/portable_env"
 
             # 3. Prepare requirements file
             REQ_FILE="requirements/portable/requirements_amd.txt"
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+                # HIP wheels are unavailable on Windows; retrieval uses CPU there.
+                TORCH_BACKEND="cpu"
+            else
+                TORCH_BACKEND="rocm"
+            fi
 
             cd "textgen-${VERSION_CLEAN}"
 
             # 4. Install packages
             echo "Installing Python packages from $REQ_FILE..."
             $PIP_PATH install --target="./$PACKAGES_PATH" -r "$REQ_FILE"
+            $PIP_PATH check
+            ${PIP_PATH% -m pip} scripts/verify_portable_rewrite.py --torch-backend "$TORCH_BACKEND"
 
             # 5. Clean up
             rm -rf .git cmd* update_wizard* Colab-TextGen-GPU.ipynb docker setup.cfg .github .gitignore requirements/ one_click.py
@@ -167,7 +176,7 @@ jobs:
             fi
 
             echo "Downloading Electron ${ELECTRON_VERSION} (${ELECTRON_ZIP})..."
-            curl -L -o /tmp/electron.zip \
+            curl --fail --location --retry 3 -o /tmp/electron.zip \
                 "https://github.com/electron/electron/releases/download/v${ELECTRON_VERSION}/${ELECTRON_ZIP}"
             mkdir electron
             unzip -q /tmp/electron.zip -d electron
@@ -194,6 +203,9 @@ jobs:
                 esac
             done
             shopt -u dotglob
+
+            # Verify the final app layout before distributing the archive.
+            (cd "${APP_DIR}" && ${PIP_PATH% -m pip} scripts/verify_portable_rewrite.py --torch-backend "$TORCH_BACKEND")
 
             # 6. Create archive
             cd ..

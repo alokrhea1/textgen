@@ -1,4 +1,4 @@
-# Optional Gemma 4 12B Unified support. Install after the normal webui
-# requirements in a separate environment: this overrides its Transformers pin.
--r rewrite.txt
+# Optional Gemma 4 Unified override: install after base requirements.
+# Deliberately omits the normal Transformers pin.
+-r rewrite-common.txt
 transformers==5.10.4

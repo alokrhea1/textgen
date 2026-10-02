@@ -16,7 +16,7 @@ def native(monkeypatch):
     shared.stop_everything = False
     shared.bos_token, shared.eos_token = '<bos>', '<eos>'
     generation = ModuleType('modules.text_generation')
-    generation.get_encoded_length = len
+    generation.get_rewrite_prompt_length = lambda prompt, state: len(prompt)
     generation.get_max_prompt_length = lambda state: state['truncation_length'] - state['max_new_tokens']
     generation.replies = ['A vivid replacement. ']
     generation.closed = False
@@ -249,3 +249,18 @@ def test_native_iterator_exit_waits_for_worker(native, monkeypatch):
         release_worker.set()
     assert worker_finished.is_set()
     assert not iterator.thread.is_alive()
+
+
+def test_prompt_planning_passes_generation_state_to_native_counter(native):
+    settings = state()
+    settings['add_bos_token'] = False
+    measured = []
+
+    def count(prompt, actual_state):
+        measured.append(actual_state)
+        return len(prompt) + (1 if actual_state['add_bos_token'] else 0)
+
+    native.generation.get_rewrite_prompt_length = count
+    plan = prepare_prompt('Original sentence.', last_sentence('Original sentence.'), hits(), settings)
+    assert plan.token_count == len(plan.prompt)
+    assert measured and all(actual_state is settings for actual_state in measured)

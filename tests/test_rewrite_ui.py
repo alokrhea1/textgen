@@ -479,3 +479,82 @@ def test_cleanup_preference_restoration(make_ui):
     path.write_text(json.dumps(dict(cleanup='scanned_book', join_hyphenated_lines=True)))
     defaults = h.module._defaults('notebook')
     assert defaults['cleanup'] == 'scanned_book' and defaults['join_hyphenated_lines'] is True
+
+
+@pytest.mark.parametrize('available,expected', [(False, 'cpu'), (True, 'cuda')])
+def test_embedding_device_auto_detects_torch_capability(make_ui, monkeypatch, available, expected):
+    h = make_ui()
+    torch = ModuleType('torch')
+    torch.cuda = SimpleNamespace(is_available=lambda: available)
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    assert h.module._default_embedding_device() == expected
+    assert h.module._defaults('notebook')['device'] == expected
+
+
+def test_embedding_device_missing_torch_falls_back_to_cpu(make_ui, monkeypatch):
+    h = make_ui()
+    monkeypatch.setitem(sys.modules, 'torch', None)
+    assert h.module._default_embedding_device() == 'cpu'
+
+
+def test_embedding_device_broken_gpu_probe_falls_back_to_cpu(make_ui, monkeypatch):
+    h = make_ui()
+    torch = ModuleType('torch')
+    def unavailable():
+        raise RuntimeError('GPU runtime unavailable')
+    torch.cuda = SimpleNamespace(is_available=unavailable)
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    assert h.module._default_embedding_device() == 'cpu'
+
+
+@pytest.mark.parametrize('available,saved', [(True, 'cpu'), (False, 'cuda:1')])
+def test_saved_embedding_device_overrides_auto_detection(make_ui, monkeypatch, available, saved):
+    import json
+
+    h = make_ui()
+    torch = ModuleType('torch')
+    torch.cuda = SimpleNamespace(is_available=lambda: available)
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    path = h.module._settings_path('notebook')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'device': saved}))
+    assert h.module._defaults('notebook')['device'] == saved
+
+
+@pytest.mark.parametrize('cuda_available,mps_available,expected',
+                         [(False, True, 'mps'), (False, False, 'cpu'), (True, True, 'cuda')])
+def test_embedding_device_prefers_cuda_then_mps(make_ui, monkeypatch, cuda_available, mps_available, expected):
+    h = make_ui()
+    torch = ModuleType('torch')
+    torch.cuda = SimpleNamespace(is_available=lambda: cuda_available)
+    torch.backends = SimpleNamespace(mps=SimpleNamespace(is_available=lambda: mps_available))
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    assert h.module._default_embedding_device() == expected
+    assert any(choice[1] == 'mps' for choice in h.c['device'].choices)
+
+
+def test_embedding_device_broken_mps_probe_falls_back_to_cpu(make_ui, monkeypatch):
+    h = make_ui()
+    torch = ModuleType('torch')
+    torch.cuda = SimpleNamespace(is_available=lambda: False)
+    def unavailable():
+        raise RuntimeError('MPS runtime unavailable')
+    torch.backends = SimpleNamespace(mps=SimpleNamespace(is_available=unavailable))
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    assert h.module._default_embedding_device() == 'cpu'
+
+
+@pytest.mark.parametrize('callback,review', [('automatic_commit', False), ('commit', True)])
+def test_applied_status_retains_context_trim_notice(make_ui, monkeypatch, callback, review):
+    h = make_ui()
+    def engine(*args, **kwargs):
+        yield SimpleNamespace(text='Better sentence.', status='Complete', done=True,
+                              plan=SimpleNamespace(context_trimmed=True))
+    monkeypatch.setattr(h.module, 'generate_rewrite', engine)
+    args = run_args(h, review=review)
+    list(h.callbacks['rewrite'].fn(*args))
+    assert h.session.pending['context_trimmed'] is True
+    result = h.callbacks[callback].fn(h.session, args[1], args[2], 'draft', {}, '')
+    assert result[h.c['status']].startswith('Rewrite applied.')
+    assert 'Older notebook context was trimmed' in result[h.c['status']]
+    assert 'every reference was retained' in result[h.c['status']]

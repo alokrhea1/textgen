@@ -165,7 +165,7 @@ def validate_rewrite_prompt(question, state, input_ids=None, inputs_embeds=None,
     if original_budget is not None:
         budget = min(budget, original_budget)
     if input_ids is None and inputs_embeds is None:
-        count = len(encode(question, add_bos_token=state['add_bos_token'])[0])
+        count = get_rewrite_prompt_length(question, state, use_extensions=False)
     else:
         lengths = []
         if input_ids is not None:
@@ -205,7 +205,10 @@ def encode(prompt, add_special_tokens=True, add_bos_token=True, truncation_lengt
         from modules.torch_utils import get_device
 
         if shared.model.__class__.__name__ in ['Exllamav3Model', 'TensorRTLLMModel']:
-            input_ids = shared.tokenizer.encode(str(prompt))
+            if shared.model.__class__.__name__ == 'TensorRTLLMModel':
+                input_ids = shared.model.encode_prompt(str(prompt), add_bos_token=add_bos_token)
+            else:
+                input_ids = shared.tokenizer.encode(str(prompt))
             if shared.model.__class__.__name__ not in ['Exllamav3Model']:
                 input_ids = np.array(input_ids).reshape(1, len(input_ids))
         else:
@@ -249,6 +252,21 @@ def get_encoded_length(prompt):
         return length_after_extensions
 
     return len(encode(prompt)[0])
+
+
+def get_rewrite_prompt_length(prompt, state, use_extensions=True):
+    """Count the tokens the selected loader will actually use for rewriting."""
+    if use_extensions:
+        length = apply_extensions('tokenized_length', prompt)
+        if length is not None:
+            return length
+
+    model_name = shared.model.__class__.__name__
+    if model_name == 'Exllamav3Model':
+        return int(shared.model.encode_rewrite_prompt(str(prompt), state).shape[-1])
+    if model_name == 'TensorRTLLMModel':
+        return len(shared.model.encode_prompt(str(prompt), add_bos_token=state['add_bos_token']))
+    return len(encode(prompt, add_bos_token=state['add_bos_token'])[0])
 
 
 def get_token_ids(prompt):
@@ -562,12 +580,15 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
 
     except Exception:
         logger.exception("Failed to generate reply (HF)")
+        if rewrite_guard:
+            raise
     finally:
         t1 = time.time()
         original_tokens = len(original_input_ids[0])
         new_tokens = len(output) - (original_tokens if not shared.is_seq2seq else 0)
         logger.info(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {seed})')
-        return
+        if not rewrite_guard:
+            return
 
 
 def generate_reply_custom(question, original_question, state, stopping_strings=None, is_chat=False):
@@ -601,18 +622,30 @@ def generate_reply_custom(question, original_question, state, stopping_strings=N
 
     except Exception:
         logger.exception("Failed to generate reply (custom)")
+        if state.get('_rewrite_generation_guard', False):
+            raise
     finally:
         t1 = time.time()
 
-        if hasattr(shared.model, 'last_prompt_token_count'):
+        if state.get('_rewrite_generation_guard', False):
+            # Cleanup must not tokenize again: llama.cpp tokenization is an
+            # HTTP request and could block Stop or mask the original failure.
+            context = getattr(shared.model, 'last_prompt_token_count', None)
+            context_info = f', context {context}' if context is not None else ''
+            logger.info(
+                f'Output generated in {(t1-t0):.2f} seconds '
+                f'({len(reply)} characters{context_info}, seed {state["seed"]})'
+            )
+        elif hasattr(shared.model, 'last_prompt_token_count'):
             original_tokens = shared.model.last_prompt_token_count
             new_tokens = len(encode(reply)[0]) if reply else 0
         else:
             original_tokens = len(encode(original_question)[0])
             new_tokens = len(encode(original_question + reply)[0]) - original_tokens
 
-        logger.info(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {state["seed"]})')
-        return
+        if not state.get('_rewrite_generation_guard', False):
+            logger.info(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {state["seed"]})')
+            return
 
 
 def print_prompt(prompt, max_chars=-1):

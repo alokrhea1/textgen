@@ -87,7 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          repository: 'oobabooga/textgen'
+          # Build this fork, including its native Rewrite modules.
           ref: ${{ inputs.version }}
           submodules: 'recursive'
 
@@ -98,10 +98,11 @@ jobs:
       - name: Build Package
         shell: bash
         run: |
+            set -euo pipefail
             VERSION_CLEAN="${{ inputs.version }}"
             VERSION_CLEAN="${VERSION_CLEAN#v}"
             cd ..
-            cp -r textgen "textgen-ik-${VERSION_CLEAN}"
+            cp -r "$GITHUB_WORKSPACE" "textgen-ik-${VERSION_CLEAN}"
             cd "textgen-ik-${VERSION_CLEAN}"
 
             # Remove extensions that need additional requirements
@@ -129,7 +130,7 @@ jobs:
             # 2. Download and extract Python
             echo "Downloading Python for $PLATFORM..."
             cd ..
-            curl -L -o python-build.tar.gz "$PYTHON_URL"
+            curl --fail --location --retry 3 -o python-build.tar.gz "$PYTHON_URL"
             tar -xzf python-build.tar.gz
             mv python "textgen-ik-${VERSION_CLEAN}/portable_env"
 
@@ -141,6 +142,8 @@ jobs:
             # 5. Install packages
             echo "Installing Python packages from $REQ_FILE..."
             $PIP_PATH install --target="./$PACKAGES_PATH" -r "$REQ_FILE"
+            $PIP_PATH check
+            ${PIP_PATH% -m pip} scripts/verify_portable_rewrite.py --torch-backend cpu
 
             # 6. Clean up
             rm -rf .git cmd* update_wizard* Colab-TextGen-GPU.ipynb docker setup.cfg .github .gitignore requirements/ one_click.py
@@ -167,7 +170,7 @@ jobs:
             fi
 
             echo "Downloading Electron ${ELECTRON_VERSION} (${ELECTRON_ZIP})..."
-            curl -L -o /tmp/electron.zip \
+            curl --fail --location --retry 3 -o /tmp/electron.zip \
                 "https://github.com/electron/electron/releases/download/v${ELECTRON_VERSION}/${ELECTRON_ZIP}"
             mkdir electron
             unzip -q /tmp/electron.zip -d electron
@@ -199,6 +202,9 @@ jobs:
             sed -i 's/"--portable", "--api"/"--portable", "--ik", "--api"/' "${APP_DIR}/main.js"
             sed -i 's|--portable --api|--portable --ik --api|g' textgen 2>/dev/null || true
             sed -i 's|--portable --api|--portable --ik --api|g' textgen.bat 2>/dev/null || true
+
+            # Verify the final app layout before distributing the archive.
+            (cd "${APP_DIR}" && ${PIP_PATH% -m pip} scripts/verify_portable_rewrite.py --torch-backend cpu)
 
             # 7. Create archive
             cd ..

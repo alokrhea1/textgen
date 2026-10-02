@@ -2,7 +2,8 @@ version: "3.3"
 services:
   textgen:
     build:
-      context: .
+      context: ../..
+      dockerfile: docker/cpu/Dockerfile
       args:
         BUILD_EXTENSIONS: ${BUILD_EXTENSIONS:-}
         APP_GID: ${APP_GID:-6972}

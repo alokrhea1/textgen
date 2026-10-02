@@ -4,15 +4,28 @@ The **Rewrite** subtab is available in both Notebook layouts. It retrieves examp
 
 ## Install and first use
 
-Activate your existing textgen Python environment, then install the optional dependencies:
+Supported full and portable installation profiles include Rewrite dependencies automatically. Use a portable artifact built from this fork: upstream release archives do not contain these changes. For an existing installation that lacks the dependencies, activate its textgen Python environment and install:
 
 ```sh
 python -m pip install -r requirements/rewrite.txt
 ```
 
-This adds Sentence Transformers and its dependencies. Model weights are separate downloads, and embeddings plus the optional reranker models can require substantial memory alongside your generation model. The UI defaults to CUDA; select **cpu** if CUDA is unavailable, or another available CUDA device to separate workloads.
+This adds Sentence Transformers and its dependencies; the installation profile selects PyTorch for your hardware. Model weights are separate downloads, and embeddings plus the optional reranker models can require substantial memory alongside your generation model. The UI selects CUDA when available, then Apple MPS, then CPU; saved device choices are preserved. Choose another available CUDA device to separate workloads. Retrieval uses PyTorch independently of the generation backend.
 
-For Gemma 4 12B Unified, use a separate environment with the normal webui dependencies installed, then install `requirements/rewrite-gemma4.txt`. This optional file includes the Rewrite dependencies and pins `transformers==5.10.4`, overriding the normal webui pin. The Transformers loader selects the multimodal loading path specifically when the model configuration declares `gemma4_unified`.
+| Installation profile | Rewrite retrieval device |
+| --- | --- |
+| Portable CUDA 12.4 | CUDA, using CUDA 12.4 PyTorch 2.6. |
+| Portable CUDA 13.1 | CUDA, using CUDA 12.8 PyTorch 2.9 with CUDA 13.1-capable drivers. |
+| Linux AMD | ROCm 7.2 PyTorch; select the PyTorch `cuda` device name. |
+| Windows AMD | CPU; the bundled ROCm PyTorch distribution is Linux-only. GGUF generation retains its AMD backend. |
+| CPU or Vulkan | CPU PyTorch; Rewrite has no PyTorch Vulkan backend. |
+| Apple Silicon | MPS embeddings and reranking with exact CPU token matching, or entirely CPU. |
+
+Rewrite requires Python 3.10 or newer; the full installer uses Python 3.13. Native Intel macOS is unsupported and the one-click installer rejects it: the current Transformers stack requires PyTorch >=2.4, while Intel macOS wheels stop at 2.2.2. Use Linux with the CPU profile on Intel Mac hardware. Retained Apple Intel requirements files are legacy references.
+
+For Gemma 4 12B Unified, use a separate environment with the normal webui dependencies installed, then install `requirements/rewrite-gemma4.txt`. This optional file includes the Rewrite dependencies and pins `transformers==5.10.4`, overriding the normal webui pin. One-click updates automatically preserve that exact installed override and record the selection; `REWRITE_GEMMA4=1` explicitly enables it, and `REWRITE_GEMMA4=0` restores the normal pin. Manual requirements reinstalls require reapplying the override. The Transformers loader selects the multimodal loading path specifically when the model configuration declares `gemma4_unified`.
+
+Installation profile support describes dependency selection, not completed runtime validation on every platform or generation backend. See the validation section below for tested loaders and environments. TensorRT-LLM runtime verification remains pending.
 
 1. Load your generation model and open Notebook → **Rewrite**.
 2. Enter local `.txt` files or directories, one path per line. These are server paths; relative paths start in the application directory. Files must be UTF-8 (a UTF-8 BOM is accepted). **Include subdirectories** defaults to enabled. Explicit symlink paths and symlink text files are rejected; symlink subdirectories are not traversed.
@@ -68,7 +81,7 @@ Rewriting uses the application's native generation path, current sampling settin
 
 **Enable model thinking for this rewrite** defaults to disabled. It sets the thinking option for this Rewrite generation request; enable it when you want the loaded model's supported thinking behavior. Gemma testing exhausted both 256- and 1,024-token allowances with thinking enabled and produced no usable final sentence; leave it disabled for short rewrites unless you deliberately allocate a larger budget.
 
-Generation stops at the first confirmed complete sentence. **Stop generation** sets this Rewrite session's cancellation event and preserves the previous notebook text. Cancellation is checked during retrieval source hashing, candidate scoring, nuance reranking, and native generation; model loading or an in-flight inference batch can delay its effect. The button does not set the global stop flag for unrelated generation. Custom stopping strings, exhausted token allowance, or model output that ends before a usable complete sentence can also produce an error; no partial replacement is applied. Native integration is implemented across loaders through shared generation and token counting. End-to-end browser validation passed with **Mistral-Nemo-Instruct-2407 and Gemma 4 12B IT using the Transformers loader**, including both layouts, Stop/retry, repeated seed rewriting, exact token matching, custom stopping strings, incomplete-output recovery, and subsequent ordinary Notebook generation. Other loaders have source/adapter checks but have not been runtime-validated.
+Generation stops at the first confirmed complete sentence. **Stop generation** sets this Rewrite session's cancellation event and preserves the previous notebook text. Cancellation is checked during retrieval source hashing, candidate scoring, nuance reranking, and native generation; model loading or an in-flight inference batch can delay its effect. The button does not set the global stop flag for unrelated generation. Custom stopping strings, exhausted token allowance, or model output that ends before a usable complete sentence can also produce an error; no partial replacement is applied. Native integration uses shared generation with loader-specific token counting and final prompt-budget checks. Backend errors reach the Rewrite status; custom backends release their active requests on cancellation or early generator closure. The validation section records the tested models and loaders.
 
 ## Storage, limits, and developer notes
 
@@ -100,7 +113,34 @@ This writes `/workspace/literary-corpus/prepared/vladimir_nabokov/lolita.txt` an
 
 A local comparison saved 72 rewrites: eight neutral queries against each of these three author corpora, with Nemo at temperature 0.3 and Gemma at both 0.3 and 1.0. Each case uses identical references across models, seed 42, bf16, and thinking disabled. Nabokov cases received additional composition guidance, so cross-author differences do not isolate the corpus alone. In these examples Gemma preserved claims more reliably, while Nemo more often introduced meaning drift or omitted details. Both can still change implications; distinct author voice remains inconsistent. The standalone `/workspace/literary-corpus/comparison.html` contains the outputs and retrieved references. This is a small qualitative comparison, with one sample per condition, not an established general model ranking.
 
-Final validation passed 143 checks with the Gemma environment, including the explicit CUDA scoring check. The original Transformers 5.6 environment passed 142 checks with that CUDA opt-in skipped. The `tests/test_rewrite_*.py` suites cover segmentation, token limits, cache invalidation and transactional failure, retrieval, reranking, prompt budgets, native generation adapters, and UI application guards. They use controlled fixtures for reproducible behavior; these checks do not establish semantic accuracy for arbitrary text or runtime support for every loader.
+## Validation
+
+Follow-up automated validation passed **210 checks and 17 subtests**, including the explicit CUDA scoring check. The `tests/test_rewrite_*.py` suites cover segmentation, token limits, cache invalidation and transactional failure, retrieval, reranking, prompt budgets, native generation adapters, and UI application guards. They use controlled fixtures for reproducible behavior; these checks do not establish semantic accuracy for arbitrary text or runtime support for every loader.
+
+Real browser workflows passed on Linux with NVIDIA A40 GPUs:
+
+| Generation loader | Actual model tested |
+| --- | --- |
+| Transformers | Mistral-Nemo-Instruct-2407 BF16 and Gemma 4 12B IT BF16. |
+| llama.cpp | Mistral-Nemo-Instruct-2407 Q4_K_M GGUF, binaries 0.138.0 CUDA 12.4. |
+| ik_llama.cpp | The same Nemo GGUF, ik binaries 0.138.0 CUDA 12.4. |
+| ExLlamav3 | Nemo BF16, ExLlama 0.0.34. |
+| ExLlamav3_HF | Nemo BF16, ExLlama 0.0.34. |
+| TensorRT-LLM | Controlled adapter/worker tests only; actual model runtime remains unverified. |
+
+Each completed browser workflow covers real corpus ingestion and retrieval, build lock/failure/retry, both Notebook layouts, sentence replacement with surrounding text preserved, manual seeds, repeated rewrites, Stop/retry, review conflicts, undo, exact token matching, incomplete-output and custom-stop recovery, and subsequent ordinary Notebook generation. This verifies the exercised models and settings; it does not establish compatibility with every model, extension, or sampling configuration.
+
+Fresh Linux Python 3.13 profiles were also installed independently of the original development environment:
+
+- CUDA 12.4 portable: PyTorch 2.6.0+cu124, Transformers 5.6.2, Sentence Transformers 6.1.0; dependency checks, packaged-module imports, and the entire browser workflow passed with both generation and retrieval on GPUs.
+- CPU portable: PyTorch 2.9.0+cpu with the same Transformers/Sentence Transformers versions; dependency checks, imports, and real LateOn → SQLite → exact MaxSim → STS/NLI reranking passed on CPU.
+- Full NVIDIA: PyTorch 2.9.0+cu128, Transformers 5.6.2, Sentence Transformers 6.1.0; dependency checks, imports, and the complete Nemo BF16/ExLlamav3 browser workflow passed using the shipped ExLlama 0.0.34 and Flash Attention 2.8.3 wheels.
+
+The full upstream dependency set emits a TorchAO 0.15 C++ extension compatibility warning with PyTorch 2.9; TorchAO-quantized checkpoints were not part of these model runs.
+
+Windows, macOS, ROCm and CUDA 13.1 package runtime checks, Docker image builds, and Colab execution were not performed on this Linux host. Their installation routes and build checks were reviewed; Docker data exclusions were additionally checked using Docker's pattern matcher. No portable release archive has been published by this verification work.
+
+The optional TensorRT loader can use a separate dependency environment so its older Transformers requirements do not replace the retrieval stack. On Linux with Python 3.12 and OpenMPI installed, run `python scripts/setup_tensorrt.py`; it creates `user_data/tensorrt_runtime` with TensorRT-LLM 1.0.0 and CUDA 12.8 PyTorch 2.7.1. The loader detects that environment, or accepts `--tensorrt-llm-python /path/to/bin/python`. This runtime path remains experimental until a real engine build and generation run complete.
 
 For an opt-in browser smoke workflow, install Playwright and its Chromium browser in your developer environment, start textgen with a generation model loaded and Rewrite dependencies installed, then run:
 

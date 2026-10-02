@@ -63,8 +63,20 @@ def _settings_path(mode):
     return shared.user_data_dir / 'retrieval_indexes' / f'{mode}-settings.json'
 
 
+def _default_embedding_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return 'cuda'
+        mps = getattr(getattr(torch, 'backends', None), 'mps', None)
+        return 'mps' if mps is not None and mps.is_available() else 'cpu'
+    except Exception:
+        # Missing or incompatible optional GPU libraries must not prevent UI creation.
+        return 'cpu'
+
+
 def _defaults(mode):
-    values = dict(paths='', recursive=True, model=DEFAULT_MODEL, revision='', device='cuda',
+    values = dict(paths='', recursive=True, model=DEFAULT_MODEL, revision='', device=_default_embedding_device(),
                   max_tokens=256, batch_size=16, local_files_only=False, max_sentences=3, cleanup='conservative', join_hyphenated_lines=False)
     if not shared.args.multi_user:
         try:
@@ -172,7 +184,7 @@ def create_ui(mode='notebook'):
                                         value=defaults['model'], allow_custom_value=True,
                                         info='A Hugging Face ColBERT ID or a local trained checkpoint.'))
             with gr.Row():
-                control('device', gr.Dropdown(label='Embedding device', choices=['cuda', 'cuda:0', 'cuda:1', 'cpu'],
+                control('device', gr.Dropdown(label='Embedding device', choices=['cuda', 'cuda:0', 'cuda:1', 'mps', 'cpu'],
                                              value=defaults['device'], allow_custom_value=True))
                 control('revision', gr.Textbox(label='Model revision (optional commit)', value=defaults['revision']))
                 control('local_files_only', gr.Checkbox(label='Offline: cached/local models only', value=defaults['local_files_only']))
@@ -385,7 +397,8 @@ def create_event_handlers(mode='notebook'):
                     raise InterruptedError('No completed rewrite was produced. Notebook text is unchanged.')
                 after = replace_sentence(working, span, final.text)
                 s.pending = dict(before=original, after=after, text=text, left=left,
-                                 prompt=prompt_name, review=review, replacement=final.text, seed=seed)
+                                 prompt=prompt_name, review=review, replacement=final.text, seed=seed,
+                                 context_trimmed=bool(final.plan and final.plan.context_trimmed))
                 message = f'Rewrite ready using {len(hits)} references.'
                 if final.plan and final.plan.context_trimmed:
                     message += ' Older notebook context was trimmed to fit the model; every reference was retained.'
@@ -447,6 +460,8 @@ def create_event_handlers(mode='notebook'):
             result = {session: s, notebook: after, html_output: generate_basic_html(html.escape(after)), interface: state,
                       c['status']: 'Rewrite applied. Edit the text or click Rewrite again to continue.',
                       c['apply']: gr.update(interactive=False), c['undo']: gr.update(interactive=True)}
+            if pending.get('context_trimmed'):
+                result[c['status']] += ' Older notebook context was trimmed to fit the model; every reference was retained.'
             if seed == pending['seed']:
                 result[c['seed']] = ''
             if mode == 'notebook':

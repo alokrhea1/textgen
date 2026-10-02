@@ -1,24 +1,17 @@
-FROM nvidia/cuda:13.0.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
-# Install Python 3.12, Git, and OpenMPI
-RUN apt update && apt install -y python3.12 python3-pip git build-essential openmpi-bin libopenmpi-dev
-
-# Set the working directory
-WORKDIR /app
-
-# This is needed to avoid an error about "Failed to build mpi4py" in the next command
+# The webui and TensorRT worker deliberately use separate Python environments.
+RUN apt update && apt install -y python3.12 python3.12-venv python3-pip git build-essential openmpi-bin libopenmpi-dev && rm -rf /var/lib/apt/lists/*
 ENV LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV PATH=/opt/webui/bin:$PATH
 
-# Install textgen
-RUN git clone https://github.com/oobabooga/textgen
+# Build from the fork checkout: docker build -f docker/TensorRT-LLM/Dockerfile .
+COPY . /app/textgen
 WORKDIR /app/textgen
-RUN pip install --break-system-packages -r requirements/full/requirements.txt
+RUN python3.12 -m venv /opt/webui && \
+    python -m pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128 && \
+    python -m pip install -r requirements/full/requirements.txt && \
+    python scripts/setup_tensorrt.py --python /usr/bin/python3.12 --runtime-dir /opt/tensorrt_runtime
 
-# Install TensorRT-LLM
-RUN pip3 install --break-system-packages tensorrt_llm==1.1.0 --extra-index-url https://pypi.nvidia.com
-
-# Expose the necessary port for the Python server
 EXPOSE 7860 5000
-
-# Run the Python server.py script with the specified command
-CMD ["python3", "server.py", "--api", "--listen"]
+CMD ["python", "server.py", "--api", "--listen", "--tensorrt-llm-python", "/opt/tensorrt_runtime/bin/python"]

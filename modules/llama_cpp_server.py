@@ -1,7 +1,9 @@
 import atexit
+import http.client
 import json
 import os
 import pprint
+import queue
 import shlex
 import re
 import socket
@@ -152,6 +154,20 @@ class LlamaServer:
         if n_probs and n_probs > 0:
             payload["n_probs"] = n_probs
 
+        if state.get('_rewrite_generation_guard'):
+            # /completion has no skip_special_tokens option. Both llama.cpp
+            # servers accept preserved_tokens, keeping reasoning delimiters
+            # visible to Rewrite's sentence extraction without --special's
+            # server-wide change to ordinary generation.
+            payload['preserved_tokens'] = [
+                '<think>', '</think>', '<seed:think>', '</seed:think>',
+                '<|channel|>', '<|message|>', '<|start|>', '<|end|>',
+                '<|channel>', '<channel|>', '<|think|>', '<|content|>',
+                '<|im_start|>', '<|im_end|>', '<|return|>', '<|eot_id|>',
+                '<start_of_turn>', '<end_of_turn>', '<turn|>',
+                '<|fim_suffix|>', '<|endoftext|>', '<s>', '</s>',
+            ]
+
         return payload
 
     def _process_images_for_generation(self, state: dict) -> List[Any]:
@@ -175,7 +191,97 @@ class LlamaServer:
         """Check if this model supports multimodal input."""
         return shared.args.mmproj not in [None, 'None']
 
+    def _rewrite_stream_lines(self, payload, stop_event):
+        """Read a dedicated connection while Stop can interrupt headers or tokens.
+
+        requests exposes its socket only after response headers arrive. Rewrite
+        needs to stop during prompt evaluation too, so it owns this connection
+        from connect through close. The worker never touches shared generation
+        state or the reusable requests session.
+        """
+        messages = queue.Queue(maxsize=16)
+        cancelled = threading.Event()
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=120)
+        transport = []
+
+        def stopped():
+            return cancelled.is_set() or shared.stop_everything or (stop_event and stop_event.is_set())
+
+        def send(kind, value=None):
+            while not cancelled.is_set():
+                try:
+                    messages.put((kind, value), timeout=0.05)
+                    return
+                except queue.Full:
+                    pass
+
+        def read():
+            response = None
+            try:
+                connection.connect()
+                transport.append(connection.sock)
+                if stopped():
+                    return
+                connection.request('POST', '/completion', body=json.dumps(payload).encode('utf-8'),
+                                   headers={'Content-Type': 'application/json'})
+                response = connection.getresponse()
+                if response.status == 400:
+                    error = json.loads(response.read()).get('error', {})
+                    if error.get('type') == 'exceed_context_size_error':
+                        raise ValueError('Sentence rewrite prompt exceeds the available llama.cpp context.')
+                    raise requests.HTTPError(f'llama.cpp completion failed: {error}')
+                if response.status >= 400:
+                    raise requests.HTTPError(f'llama.cpp completion failed: HTTP {response.status}')
+                while not stopped():
+                    line = response.readline()
+                    if not line:
+                        break
+                    send('line', line.rstrip(b'\r\n'))
+            except Exception as error:
+                if not stopped():
+                    send('error', error)
+            finally:
+                try:
+                    if response is not None:
+                        response.close()
+                finally:
+                    try:
+                        connection.close()
+                    finally:
+                        send('done')
+
+        worker = threading.Thread(target=read, name='rewrite-llama-http', daemon=True)
+        worker.start()
+        try:
+            while not stopped():
+                try:
+                    kind, value = messages.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if kind == 'done':
+                    break
+                if kind == 'error':
+                    raise value
+                yield value
+        finally:
+            cancelled.set()
+            # shutdown interrupts a blocked response-header or body read. Let
+            # the worker close HTTPResponse itself to avoid its buffered-reader
+            # lock blocking the UI's Stop callback.
+            if transport:
+                try:
+                    transport[0].shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            worker.join(timeout=0.2)
+
     def generate_with_streaming(self, prompt, state):
+        stop_event = state.get('stop_event')
+        if state.get('_rewrite_generation_guard') and (
+            shared.stop_everything or (stop_event and stop_event.is_set())
+        ):
+            return
+
         url = f"http://127.0.0.1:{self.port}/completion"
         payload = self.prepare_payload(state)
 
@@ -211,6 +317,22 @@ class LlamaServer:
         else:
             max_new_tokens = state['max_new_tokens']
 
+        if state.get('_rewrite_generation_guard'):
+            # Recheck the exact tokens sent to the server, including BOS,
+            # against its real context (which --fit may have reduced).
+            context = min(state['truncation_length'], self.n_ctx or state['truncation_length'])
+            budget = context - state['max_new_tokens']
+            if budget <= 0 or self.last_prompt_token_count > budget:
+                raise ValueError(
+                    f'Sentence rewrite prompt requires {self.last_prompt_token_count} tokens; '
+                    f'only {budget} prompt tokens are available in the llama.cpp context. '
+                    'References will not be silently truncated.'
+                )
+            if state['auto_max_new_tokens']:
+                max_new_tokens = context - self.last_prompt_token_count
+            if stop_event and stop_event.is_set():
+                return
+
         payload.update({
             "n_predict": max_new_tokens,
             "stream": True,
@@ -228,17 +350,18 @@ class LlamaServer:
         self.last_completion_token_count = 0
 
         # Make the generation request
-        response = self.session.post(url, json=payload, stream=True)
+        rewrite = state.get('_rewrite_generation_guard', False)
+        response = None if rewrite else self.session.post(url, json=payload, stream=True)
+        lines = self._rewrite_stream_lines(payload, stop_event) if rewrite else response.iter_lines()
         try:
-            if response.status_code == 400 and response.json().get("error", {}).get("type") == "exceed_context_size_error":
+            if response is not None and response.status_code == 400 and response.json().get("error", {}).get("type") == "exceed_context_size_error":
                 logger.error("The request exceeds the available context size, try increasing it")
                 return
-            else:
+            elif response is not None:
                 response.raise_for_status()  # Raise an exception for HTTP errors
 
             # Process the streaming response
-            stop_event = state.get('stop_event')
-            for line in response.iter_lines():
+            for line in lines:
                 if shared.stop_everything or (stop_event and stop_event.is_set()):
                     break
 
@@ -276,7 +399,10 @@ class LlamaServer:
                     print(f"Problematic line: {line}")
                     continue
         finally:
-            response.close()
+            if rewrite:
+                lines.close()
+            else:
+                response.close()
 
     def generate(self, prompt, state):
         output = ""
