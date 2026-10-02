@@ -74,8 +74,23 @@ def main():
             results['cleanup_report'] = page.get_by_role('textbox',name='Cleanup report',exact=True).input_value()
             assert 'Source locations refer to original decoded characters.' in results['cleanup_report']
             print('Real corpus ready',status.input_value(),flush=True)
+            results['quality_report'] = page.get_by_role('textbox',name='Ingestion quality report',exact=True).input_value()
+            assert 'balanced' in results['quality_report']
+            # Acceptance can legitimately refuse an unrelated target. Confirm
+            # the UI preserves the source and permits a subsequent valid rewrite.
+            page.get_by_role('tab',name='Raw',exact=True).click()
+            unrelated='The satellite measured plasma density during a solar eruption.'
+            raw.fill(unrelated)
+            page.get_by_role('tab',name='Rewrite',exact=True).click()
+            page.get_by_role('button',name='Rewrite',exact=True).click()
+            expect(status).to_have_value(re.compile(r'^REWRITE FAILED: No retrieved references'),timeout=120000)
+            page.get_by_role('tab',name='Raw',exact=True).click()
+            expect(raw).to_have_value(unrelated)
+            results['weak_references_refused_without_edit']=True
+            raw.fill(original)
+            page.get_by_role('tab',name='Rewrite',exact=True).click()
             page.get_by_role('button',name='Preview references',exact=True).click()
-            expect(status).to_have_value(re.compile(r'Retrieved [0-9]+ references. Click Rewrite'),timeout=120000)
+            expect(status).to_have_value(re.compile(r'Retrieved [0-9]+(?: of requested [0-9]+)? references\. Click Rewrite'),timeout=120000)
             results['references']=page.get_by_role('textbox',name='Retrieved references and sources',exact=True).input_value()
             print('Preview passed',flush=True)
             page.get_by_role('button',name='Rewrite',exact=True).click()
@@ -152,7 +167,7 @@ def main():
             page.get_by_role('radio',name='tokens',exact=True).check()
             page.get_by_role('spinbutton',name='number input for Generation-token length tolerance',exact=True).fill('0')
             page.get_by_role('button',name='Preview references',exact=True).click()
-            expect(status).to_have_value(re.compile(r'Retrieved [0-9]+ references. Click Rewrite'),timeout=120000)
+            expect(status).to_have_value(re.compile(r'Retrieved [0-9]+(?: of requested [0-9]+)? references\. Click Rewrite'),timeout=120000)
             results['exact_token_references']=page.get_by_role('textbox',name='Retrieved references and sources',exact=True).input_value()
             assert 'generation tokens' in results['exact_token_references']
             page.get_by_role('radio',name='sentences',exact=True).check()

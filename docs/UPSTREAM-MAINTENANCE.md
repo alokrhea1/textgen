@@ -92,7 +92,7 @@ main conflict risk:
 | Generation boundary | `modules/text_generation.py`, `sentence_rewrite/engine.py` | Match actual backend BOS/special-token/extension tokenization. Preserve all references or fail; retain context-trim notices. Keep native sampling/hooks, per-request stopping, iterator cleanup, and visible Rewrite errors without changing ordinary generation. Engine/native tests plus real rewrites and ordinary Generate afterward. |
 | Native backends | `modules/exllamav3.py`, `llama_cpp_server.py`, `tensorrt_llm.py` | Recheck against actual context after loading; no silent prompt slicing. Cancel blocked requests and release jobs/sockets. Preserve reasoning markers for sentence extraction. Backend adapter tests plus real models for each changed backend. `--ik` is a distinct binary to check. |
 | Transformers/Gemma | `modules/transformers_loader.py`, `text_generation.py`, `requirements/rewrite-gemma4.txt` | Gemma Unified loading/EOS handling stays scoped to `gemma4_unified`. Recheck native template/thinking output, HF generation APIs, and model loading when changing Transformers. |
-| Retrieval and cache | `modules/sentence_rewrite/{cleanup,sentences,embeddings,corpus,reranker}.py` | Trained token projection/roles, exact MaxSim, native-token eligibility, STS/NLI scores, source offsets, transactional cache and cancellation. Corresponding unit suites and real retrieval smoke. |
+| Retrieval and cache | `modules/sentence_rewrite/{cleanup,quality,sentences,embeddings,corpus,reranker}.py` | Trained token projection/roles, exact MaxSim, native-token eligibility, STS/NLI scores, source offsets, transactional cache and cancellation. Corresponding unit suites and real retrieval smoke. |
 | Install/update | `one_click.py`, `requirements/{full,portable}/`, `requirements/rewrite*.txt`, startup/update scripts | All supported profiles include retrieval dependencies; nested includes resolve correctly. Fork updates retain origin/tracking branch; ZIP installs preserve application code. Gemma selection survives extension installs. Installer tests and clean profile installs. |
 | Distribution | `.github/workflows/build-*.yml`, `scripts/verify_portable_rewrite.py`, Dockerfiles/Compose, `.dockerignore`, `Colab-TextGen-GPU.ipynb` | Build this fork, retain final `app/` contents, verify intended Torch backend and `pip check`, exclude private runtime data. Recheck CPU/CUDA/ROCm/MPS policy, source URLs and each changed package path. |
 | Optional TensorRT isolation | `modules/tensorrt_{proxy,worker,protocol}.py`, `shared.py`, `ui_model_menu.py`, `scripts/setup_tensorrt.py`, TensorRT Dockerfile | Keep incompatible worker dependencies isolated, exact token IDs, bounded IPC, first-token cancellation and owned process-group cleanup. Controlled tests are not a real engine-build test. |
@@ -119,7 +119,7 @@ main conflict risk:
   conflict with retrieval. TensorRT runtime is experimental and was not verified
   with a real engine in the initial follow-up; do not promote it based on mocks.
 - Cache identities currently include `SCHEMA_VERSION`, the splitter identity
-  `period-spans-v1`, `CLEANUP_VERSION`, model/library/checkpoint identity and build
+  `period-spans-v1`, `CLEANUP_VERSION`, `QUALITY_VERSION`, quality policy, model/library/checkpoint identity and build
   settings. Change the appropriate identity or implement a migration when semantics
   change. Never accept an old matrix/provenance cache just because SQLite opens it.
 - Browser tests write Notebook text/settings. Run them against a scratch

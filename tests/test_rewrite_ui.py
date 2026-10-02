@@ -52,7 +52,7 @@ def make_ui(monkeypatch, tmp_path):
         functions = blocks.fns.values() if isinstance(blocks.fns, dict) else blocks.fns
         callbacks = {item.fn.__name__: item for item in functions}
         c, controls = shared.gradio['rewrite-ui-' + mode]
-        config = ['references.txt', True, module.DEFAULT_MODEL, '', 'cpu', 256, 16, True, 3, 'conservative', False]
+        config = ['references.txt', True, module.DEFAULT_MODEL, '', 'cpu', 256, 16, True, 3, 'conservative', False, 'balanced']
         session = module.RewriteSession()
         session.config, session.embedding_config = module._configs(config)
         session.encoder = SimpleNamespace(release=lambda: None)
@@ -76,7 +76,7 @@ def make_ui(monkeypatch, tmp_path):
 def run_args(h, text='Earlier sentence. Original sentence. trailing', left=None, review=False, seed=''):
     left = text if left is None else left
     return [h.session, text, left, 'draft', {'temperature': .7}, seed, '', True, review, False,
-            5, 'sentences', 1, .15, 'symmetric', 0, True, False, 50, *h.config]
+            5, 'sentences', 1, .15, 'symmetric', 0, True, False, 50, .5, .3, .8, *h.config]
 
 
 def assert_locked(h, update, locked):
@@ -163,7 +163,10 @@ def test_build_failure_retry_and_progress(make_ui, monkeypatch):
                 raise ValueError('unreadable corpus')
             return dict(files=1, candidates=1, occurrences=1,
                         cleanup=dict(mode=config.cleanup, join_hyphenated_lines=config.join_hyphenated_lines,
-                                     counts={'soft_hyphens_removed': 2}, samples=[]))
+                                     counts={'soft_hyphens_removed': 2}, samples=[]),
+                        quality=dict(policy=config.quality_policy, analyzed_spans=2, excluded_spans=1,
+                                     excluded_windows=1, flag_counts={'suspected_fragment': 1},
+                                     excluded_reasons={'suspected_fragment': 1}, samples=[]))
 
     h.session.encoder = None
     monkeypatch.setattr(h.module, 'LateInteractionEncoder', Encoder)
@@ -175,6 +178,8 @@ def test_build_failure_retry_and_progress(make_ui, monkeypatch):
     second = list(callback(h.session, *h.config, True, progress=lambda *args, **kwargs: progress.append(kwargs)))
     assert 'Corpus ready' in second[-1][h.c['status']]
     assert 'soft hyphens removed: 2' in second[-1][h.c['cleanup_report']]
+    assert 'Sentence spans excluded: 1' in second[-1][h.c['quality_report']]
+    assert 'Excluded — suspected fragment: 1' in second[-1][h.c['quality_report']]
     assert_locked(h, second[-1], False)
     assert len(progress) == 4 and attempts == [True, True]
     assert not h.session.lock.locked()
@@ -273,7 +278,7 @@ def test_generation_failure_after_preview_preserves_source_and_retry(make_ui, mo
 def test_changed_settings_require_rebuild_before_generation(make_ui):
     h = make_ui()
     args = run_args(h)
-    args[-3] = 4
+    args[-4] = 4
     events = list(h.callbacks['rewrite'].fn(*args))
     assert 'Corpus settings changed' in events[-1][h.c['status']]
     assert not h.calls and h.session.pending is None
@@ -337,6 +342,7 @@ def test_clear_retains_disk_cache_used_by_another_session(make_ui):
     assert clears == [] and releases == [True]
     assert 'another open Rewrite tab' in result[h.c['status']]
     assert other.index is index and h.session.index is None
+    assert result[h.c['quality_report']] == ''
     other.encoder = SimpleNamespace(release=lambda: None)
     h.callbacks['clear'].fn(other)
     assert clears == [True]
@@ -441,19 +447,53 @@ def test_evidence_balanced_score_components_and_legacy_fallback(make_ui):
     assert 'Late interaction 0.8000' in plain and 'Nuance score' not in plain
 
 
+@pytest.mark.parametrize('mode', ['notebook', 'default'])
+def test_reference_quality_flags_visible_as_plain_text_and_short_is_a_note(make_ui, mode):
+    h = make_ui(mode)
+    fields = dict(score=.8, sentence_count=1, token_count=5,
+                  source='<script>alert(1)</script>.txt', start=3, end=18, text='<b>Short fragment.</b>')
+    flagged = SimpleNamespace(**fields, quality_flags=('short_reference', 'suspicious_boundary'))
+    h.config[-1] = 'off'
+    h.session.config, h.session.embedding_config = h.module._configs(h.config)
+    h.session.index.search = lambda *args, **kwargs: [flagged]
+    events = list(h.callbacks['search'].fn(*run_args(h)))
+    evidence = next(event[h.c['references']] for event in events if event.get(h.c['references']))
+    assert isinstance(h.c['references'], gr.Textbox) and h.c['references'].interactive is False
+    assert 'Quality note: A short reference; retained for suitably short queries.' in evidence
+    assert 'Quality warning (suspected damage; inspect source):' in evidence
+    assert h.module.QUALITY_REASONS['suspicious_boundary'] in evidence
+    assert '<script>alert(1)</script>.txt [3:18]' in evidence
+    assert '<b>Short fragment.</b>' in evidence
+    short_only = h.module._evidence([SimpleNamespace(**fields, quality_flags=('short_reference',))])
+    assert 'Quality note:' in short_only and 'Quality warning' not in short_only
+    legacy = h.module._evidence([SimpleNamespace(**fields)])
+    assert 'Quality note:' not in legacy and 'Quality warning' not in legacy
+
+
+def test_reference_unknown_quality_flags_bounded(make_ui):
+    h = make_ui()
+    hit = SimpleNamespace(score=.8, sentence_count=1, token_count=5, source='book.txt', start=0,
+                          end=5, text='Text.', quality_flags=tuple('x' * 1000 + str(i) for i in range(10)))
+    evidence = h.module._evidence([hit])
+    assert 'x' * 241 not in evidence
+    assert evidence.count('Quality flag:') == 8
+    assert 'Additional quality flags omitted.' in evidence
+
+
 def test_cleanup_defaults_controls_and_config_wiring(make_ui):
     h = make_ui()
     assert h.c['cleanup'].value == 'conservative'
     assert h.c['join_hyphenated_lines'].value is False
     assert h.c['cleanup_report'].interactive is False
     assert h.c['cleanup_report'] not in h.controls
-    assert h.callbacks['build'].inputs[-3:-1] == [h.c['cleanup'], h.c['join_hyphenated_lines']]
+    assert h.callbacks['build'].inputs[-4:-1] == [h.c['cleanup'], h.c['join_hyphenated_lines'], h.c['quality_policy']]
     for callback in ['search', 'rewrite']:
-        assert h.callbacks[callback].inputs[-2:] == [h.c['cleanup'], h.c['join_hyphenated_lines']]
+        assert h.callbacks[callback].inputs[-3:] == [h.c['cleanup'], h.c['join_hyphenated_lines'], h.c['quality_policy']]
     config = list(h.config)
-    config[-2:] = ['scanned_book', True]
+    config[-3:] = ['scanned_book', True, 'off']
     corpus, embedding = h.module._configs(config)
     assert corpus.cleanup == 'scanned_book' and corpus.join_hyphenated_lines is True
+    assert corpus.quality_policy == 'off'
 
 
 def test_cleanup_report_counts_and_samples_are_bounded(make_ui):
@@ -470,15 +510,158 @@ def test_cleanup_report_counts_and_samples_are_bounded(make_ui):
     assert 'original decoded characters' in text
 
 
+@pytest.mark.parametrize('mode', ['notebook', 'default'])
+@pytest.mark.parametrize('callback', ['search', 'rewrite'])
+@pytest.mark.parametrize('nuance', [False, True])
+def test_quality_retrieval_controls_forwarded_and_locked(make_ui, mode, callback, nuance):
+    h = make_ui(mode)
+    captured = []
+    search = h.session.index.search
+
+    def capture(*args, **kwargs):
+        captured.append(kwargs)
+        return search(*args, **kwargs)
+
+    h.session.index.search = capture
+    h.session.reranker = SimpleNamespace(load=lambda progress: None, release=lambda: None)
+    h.session.reranker_config = ('cpu', True)
+    args = run_args(h)
+    args[17], args[19], args[20], args[21] = nuance, .65, .45, .7
+    events = list(h.callbacks[callback].fn(*args))
+    assert captured[0]['min_length_ratio'] == .65
+    assert captured[0]['min_semantic_score'] == (.45 if nuance else 0.0)
+    assert captured[0]['max_contradiction_score'] == (.7 if nuance else 1.0)
+    assert h.c['quality_policy'].value == 'balanced'
+    assert h.c['min_length_ratio'].value == .5
+    assert h.c['min_semantic_score'].value == .3
+    assert h.c['max_contradiction_score'].value == .8
+    assert h.callbacks[callback].inputs[19:22] == [h.c['min_length_ratio'], h.c['min_semantic_score'],
+                                                h.c['max_contradiction_score']]
+    assert_locked(h, events[0], True)
+    assert_locked(h, events[-1], False)
+    for name in ['quality_policy', 'min_length_ratio', 'min_semantic_score', 'max_contradiction_score']:
+        assert h.c[name] in h.controls
+    assert any('Retrieved 1 of requested 5 references.' in event.get(h.c['status'], '') for event in events)
+
+
+@pytest.mark.parametrize('mode', ['notebook', 'default'])
+def test_quality_report_is_plain_readonly_text_with_bounded_samples(make_ui, mode):
+    h = make_ui(mode)
+    report = dict(policy='balanced', analyzed_spans=12, excluded_spans=2, excluded_windows=5,
+                  flag_counts={'suspected_fragment': 2}, excluded_reasons={'suspected_fragment': 2},
+                  samples=[dict(source='<script>alert(1)</script>.txt', start=10, end=40,
+                                text='<b>fragment</b> ' + 'x' * 1000,
+                                flags=['suspected_fragment'], reasons=['suspected_fragment'],
+                                context_before='before ' + 'y' * 1000,
+                                context_after='after ' + 'z' * 1000) for _ in range(8)])
+    text = h.module._quality_report(report)
+    assert isinstance(h.c['quality_report'], gr.Textbox)
+    assert h.c['quality_report'].interactive is False
+    assert h.c['quality_report'] not in h.controls
+    assert h.c['quality_report'] in h.callbacks['build'].outputs
+    assert 'Sentence spans analyzed: 12' in text and 'Sentence spans excluded: 2' in text
+    assert 'Candidate windows excluded: 5' in text
+    assert '<script>alert(1)</script>.txt [10:40]' in text
+    assert 'Exclusion reasons: suspected_fragment' in text
+    assert 'Before: before' in text and 'After: after' in text
+    assert text.count('Sample ') == 3 and 'Additional samples omitted.' in text
+    assert all(character * 241 not in text for character in 'xyz')
+    assert 'original decoded characters' in text
+    assert 'Quality exclusions are disabled' in h.module._quality_report(dict(report, policy='off'))
+
+
+@pytest.mark.parametrize('mode', ['notebook', 'default'])
+def test_quality_report_prioritizes_later_exclusions_stably(make_ui, mode):
+    h = make_ui(mode)
+    retained = [dict(source=f'retained-{i}.txt', start=0, end=4, text='Yes.',
+                     flags=['short_reference'], reasons=[]) for i in range(10)]
+    excluded = [dict(source=f'excluded-{i}.txt', start=20, end=30, text='the house.',
+                     flags=['suspicious_boundary'], reasons=['suspicious_boundary']) for i in range(2)]
+    samples = retained + excluded
+    report = dict(policy='balanced', analyzed_spans=12, excluded_spans=2, excluded_windows=2, samples=samples)
+    text = h.module._quality_report(report)
+    assert 'Sample 1: excluded-0.txt [20:30]' in text
+    assert 'Sample 2: excluded-1.txt [20:30]' in text
+    assert 'Sample 3: retained-0.txt [0:4]' in text
+    assert 'retained-1.txt' not in text
+    assert report['samples'] == retained + excluded
+    assert 'Additional samples omitted.' in text
+
+
+@pytest.mark.parametrize('mode', ['notebook', 'default'])
+def test_all_excluded_failure_shows_quality_report_and_retry_replaces_it(make_ui, monkeypatch, mode):
+    import json
+
+    h = make_ui(mode)
+    previous = h.session.index
+    attempts = []
+    report = dict(policy='balanced', analyzed_spans=2, excluded_spans=2, excluded_windows=3,
+                  flag_counts={'suspected_fragment': 2}, excluded_reasons={'suspected_fragment': 2},
+                  samples=[dict(source='book.txt', start=5, end=15, text='fragment.',
+                                flags=['suspected_fragment'], reasons=['suspected_fragment'])])
+
+    class Encoder:
+        def __init__(self, config):
+            pass
+
+        def load(self, progress):
+            pass
+
+        def release(self):
+            pass
+
+    class Index:
+        def __init__(self, path):
+            self.path = path
+
+        def build(self, config, encoder, progress, force):
+            attempts.append(config.quality_policy)
+            if len(attempts) == 1:
+                error = ValueError('No passages passed quality screening.')
+                error.quality_report = report
+                raise error
+            return dict(files=1, candidates=1, occurrences=1,
+                        quality=dict(report, analyzed_spans=3, excluded_spans=0, excluded_windows=0, samples=[]))
+
+    monkeypatch.setattr(h.module, 'LateInteractionEncoder', Encoder)
+    monkeypatch.setattr(h.module, 'CorpusIndex', Index)
+    failed = list(h.callbacks['build'].fn(h.session, *h.config, True))
+    assert_locked(h, failed[0], True)
+    assert_locked(h, failed[-1], False)
+    assert h.session.index is previous
+    assert 'INDEX BUILD FAILED' in failed[-1][h.c['status']]
+    assert 'excluded 2 sentence spans and 3 candidate windows' in failed[-1][h.c['status']]
+    assert 'retry' in failed[-1][h.c['status']]
+    assert 'Failed build — no new corpus was published.' in failed[-1][h.c['quality_report']]
+    assert 'book.txt [5:15]' in failed[-1][h.c['quality_report']]
+    retried = list(h.callbacks['build'].fn(h.session, *h.config, True))
+    assert_locked(h, retried[-1], False)
+    assert 'Corpus ready' in retried[-1][h.c['status']]
+    assert 'Failed build' not in retried[-1][h.c['quality_report']]
+    assert 'Sentence spans excluded: 0' in retried[-1][h.c['quality_report']]
+    assert json.loads(h.module._settings_path(mode).read_text())['quality_policy'] == 'balanced'
+
+
+def test_quality_policy_change_requires_rebuild(make_ui):
+    h = make_ui()
+    args = run_args(h)
+    args[-1] = 'off'
+    events = list(h.callbacks['rewrite'].fn(*args))
+    assert 'Corpus settings changed' in events[-1][h.c['status']]
+    assert not h.calls and h.session.pending is None
+    assert_locked(h, events[-1], False)
+
+
 def test_cleanup_preference_restoration(make_ui):
     import json
 
     h = make_ui()
     path = h.module._settings_path('notebook')
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(dict(cleanup='scanned_book', join_hyphenated_lines=True)))
+    path.write_text(json.dumps(dict(cleanup='scanned_book', join_hyphenated_lines=True, quality_policy='off')))
     defaults = h.module._defaults('notebook')
     assert defaults['cleanup'] == 'scanned_book' and defaults['join_hyphenated_lines'] is True
+    assert defaults['quality_policy'] == 'off'
 
 
 @pytest.mark.parametrize('available,expected', [(False, 'cpu'), (True, 'cuda')])

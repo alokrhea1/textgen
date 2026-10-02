@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from modules.sentence_rewrite.corpus import CorpusConfig, CorpusIndex
+from modules.sentence_rewrite.corpus import CorpusConfig, CorpusIndex, CorpusQualityError
 
 
 class FakeEncoder:
@@ -323,3 +323,262 @@ def test_diversity_changes_selection_using_casefolded_word_overlap(tmp_path):
     assert [hit.text for hit in ordinary] == ['Quiet rain falls.', 'QUIET rain falls softly.']
     assert [hit.text for hit in diverse] == ['Quiet rain falls.', 'Bright sunlight returns.']
     assert [hit.score for hit in diverse] == pytest.approx([.9, .8])
+
+
+def test_quality_exclusions_have_raw_audit_and_windows_never_bridge(tmp_path):
+    import json
+    import sqlite3
+
+    source = tmp_path / 'a.txt'
+    original = 'First\tvalid\n sentence. Broken \ufffd material. Last valid sentence. Another valid ending.'
+    source.write_text(original, encoding='utf-8')
+    encoder = FakeEncoder()
+    encoded = []
+    original_encode = encoder.encode_documents
+
+    def record(texts):
+        encoded.extend(texts)
+        return original_encode(texts)
+
+    encoder.encode_documents = record
+    index = CorpusIndex(tmp_path / 'cache')
+    result = index.build(CorpusConfig(str(source), max_sentences=2), encoder)
+    assert result['quality']['analyzed_spans'] == 4
+    assert result['quality']['excluded_spans'] == 1
+    assert result['quality']['excluded_windows'] == 3
+    assert result['quality']['excluded_reasons'] == {'replacement_character': 1}
+    assert set(encoded) == {'First valid sentence.', 'Last valid sentence.', 'Another valid ending.',
+                            'Last valid sentence. Another valid ending.'}
+    sample = next(sample for sample in result['quality']['samples'] if sample['reasons'])
+    assert original[sample['start']:sample['end']] == 'Broken \ufffd material.'
+    assert sample['context_before'] == 'First valid sentence.'
+    assert 'Last valid sentence.' in sample['context_after']
+    with sqlite3.connect(index.path) as db:
+        audit = db.execute('SELECT source,start,end,text,flags,reasons FROM excluded_spans').fetchone()
+        assert audit[:4] == (str(source), sample['start'], sample['end'], sample['text'])
+        assert 'replacement_character' in json.loads(audit[4])
+        assert json.loads(audit[5]) == ['replacement_character']
+        assert db.execute('SELECT COUNT(*) FROM excluded_spans').fetchone()[0] == 1
+    assert source.read_text(encoding='utf-8') == original
+
+
+def test_contextual_ocr_exclusion_does_not_poison_valid_duplicate(tmp_path):
+    source = tmp_path / 'sources'
+    source.mkdir()
+    (source / 'a.txt').write_text('It 5 s the coldest and meanest in. the whole house.', encoding='utf-8')
+    valid = source / 'b.txt'
+    valid.write_text('the whole house.', encoding='utf-8')
+    index = CorpusIndex(tmp_path / 'cache')
+    encoder = FakeEncoder()
+    result = index.build(CorpusConfig(str(source), max_sentences=2, cleanup='scanned_book'), encoder)
+    assert result['quality']['excluded_reasons']['suspicious_boundary'] == 2
+    assert result['quality']['excluded_windows'] == 3
+    hit, = index.search('A different query.', encoder)
+    assert hit.text == 'the whole house.'
+    assert hit.provenance == ((str(valid), 0, len(hit.text)),)
+    assert hit.quality_flags == ('short_reference',)
+    assert hit.word_count == hit.content_token_count == 3
+
+
+def test_all_excluded_failure_carries_bounded_report_and_preserves_cache(tmp_path):
+    source = tmp_path / 'a.txt'
+    source.write_text('A usable sentence.', encoding='utf-8')
+    config = CorpusConfig(str(source), max_sentences=1)
+    index = CorpusIndex(tmp_path / 'cache')
+    encoder = FakeEncoder()
+    before = index.build(config, encoder)
+    before_bytes = index.path.read_bytes()
+    source.write_text(' '.join(f'Damaged \ufffd sentence number {number}.' for number in range(12)), encoding='utf-8')
+    with pytest.raises(CorpusQualityError, match='All complete corpus sentence spans') as error:
+        index.build(config, encoder)
+    assert error.value.quality_report['excluded_spans'] == 12
+    assert len(error.value.quality_report['samples']) == 10
+    assert encoder.encoded == 1
+    assert index.path.read_bytes() == before_bytes
+    assert index.manifest == before
+    assert not list(index.cache_dir.glob('.building-*'))
+
+
+def test_bad_overlimit_span_is_excluded_before_token_check(tmp_path):
+    source = tmp_path / 'a.txt'
+    source.write_text('Broken \ufffd material that is much too long. Still usable.', encoding='utf-8')
+    encoder = FakeEncoder()
+    encoder.config = SimpleNamespace(max_tokens=2, batch_size=2, device='cpu')
+    index = CorpusIndex(tmp_path / 'cache')
+    result = index.build(CorpusConfig(str(source), max_sentences=2), encoder)
+    assert result['candidates'] == 1
+    assert result['quality']['excluded_spans'] == 1
+    assert index.search('query', encoder)[0].text == 'Still usable.'
+    with pytest.raises(ValueError, match='exceeds embedding token limit'):
+        index.build(CorpusConfig(str(source), quality_policy='off'), encoder)
+
+
+def test_quality_policy_off_retains_flagged_text_and_invalidates_cache(tmp_path):
+    source = tmp_path / 'a.txt'
+    source.write_text('Broken \ufffd material. A usable sentence.', encoding='utf-8')
+    encoder = FakeEncoder()
+    index = CorpusIndex(tmp_path / 'cache')
+    balanced = CorpusConfig(str(source), max_sentences=1)
+    before = index.build(balanced, encoder)
+    unfiltered = CorpusConfig(str(source), max_sentences=1, quality_policy='off')
+    with pytest.raises(ValueError, match='changed'):
+        index.assert_current(unfiltered, encoder)
+    after = index.build(unfiltered, encoder)
+    assert before['generation'] != after['generation']
+    assert after['candidates'] == 2
+    assert after['quality']['excluded_spans'] == 0
+    assert after['quality']['flag_counts']['replacement_character'] == 1
+    assert any('replacement_character' in sample['flags'] and not sample['reasons']
+               for sample in after['quality']['samples'])
+    flagged = next(hit for hit in index.search('query', encoder) if '\ufffd' in hit.text)
+    assert 'replacement_character' in flagged.quality_flags
+    with pytest.raises(ValueError, match='quality policy'):
+        index.build(CorpusConfig(str(source), quality_policy='invented'), encoder)
+
+
+def test_old_schema_rebuilds_normally_and_failure_keeps_old_file(tmp_path):
+    import json
+    import sqlite3
+
+    source = tmp_path / 'a.txt'
+    source.write_text('A usable sentence.', encoding='utf-8')
+    index = CorpusIndex(tmp_path / 'cache')
+    encoder = FakeEncoder()
+    config = CorpusConfig(str(source), max_sentences=1)
+    previous = index.build(config, encoder)
+    previous['signature']['schema'] = 1
+    previous['signature'].pop('quality_version')
+    previous['signature']['config'].pop('quality_policy')
+    with sqlite3.connect(index.path) as db:
+        db.execute('UPDATE metadata SET value=?', (json.dumps(previous),))
+    old_bytes = index.path.read_bytes()
+    with pytest.raises(ValueError, match='older schema.*rebuild'):
+        index.search('query', encoder)
+    encoder.fail = True
+    with pytest.raises(RuntimeError, match='unavailable'):
+        index.build(config, encoder)
+    assert index.path.read_bytes() == old_bytes
+    encoder.fail = False
+    result = index.build(config, encoder)
+    assert result['signature']['schema'] == 2
+    assert result['signature']['config']['quality_policy'] == 'balanced'
+    assert result['quality']['analyzed_spans'] == 1
+
+
+def test_content_length_filter_precedes_pool_and_excludes_special_token_overhead(tmp_path):
+    source = tmp_path / 'a.txt'
+    source.write_text('Certainly. A more substantial example.', encoding='utf-8')
+    encoder = FakeEncoder()
+    encoder.token_count = lambda text: len(text.split()) + 8
+    index = CorpusIndex(tmp_path / 'cache')
+    index.build(CorpusConfig(str(source), max_sentences=1), encoder)
+
+    class Reranker:
+        def score(self, query, texts, **kwargs):
+            assert texts == ['A more substantial example.']
+            return [0.7]
+
+    hits = index.search('One two three four five six.', encoder, top_k=1,
+                        reranker=Reranker(), rerank_pool=1, min_length_ratio=0.5)
+    assert hits[0].text == 'A more substantial example.'
+    assert hits[0].content_token_count == 4
+    assert hits[0].token_count == 12
+    # Legitimate short references remain available for short queries.
+    assert index.search('Indeed.', encoder, top_k=1, min_length_ratio=0.5)[0].text == 'Certainly.'
+    # Token mode uses the generator's exact lengths, ignoring this sentence-mode filter.
+    native = index.search('One two three four five six.', encoder, top_k=1,
+                          length_mode='tokens', min_length_ratio=1, token_tolerance=0,
+                          token_counter=lambda text: 23 if text != 'A more substantial example.' else 24)
+    assert native[0].text == 'Certainly.'
+    assert native[0].token_count == 23
+
+
+def test_semantic_threshold_filters_without_backfilling_and_preserves_components(tmp_path):
+    source = tmp_path / 'a.txt'
+    source.write_text('First sentence. Second sentence. Third sentence.', encoding='utf-8')
+    encoder = FakeEncoder()
+    index = CorpusIndex(tmp_path / 'cache')
+    index.build(CorpusConfig(str(source), max_sentences=1), encoder)
+
+    class Reranker:
+        def score_details(self, query, texts, **kwargs):
+            scores = {'First sentence.': (0.95, 0.1), 'Second sentence.': (0.6, 0.3),
+                      'Third sentence.': (0.5, 0.8)}
+            return [dict(score=scores[text][0], semantic_score=scores[text][1],
+                         entailment_score=0.4, contradiction_score=0.2) for text in texts]
+
+    messages = []
+    hits = index.search('query', encoder, top_k=3, reranker=Reranker(), min_semantic_score=0.3,
+                        progress=messages.append, diversity=0.5)
+    assert [hit.text for hit in hits] == ['Second sentence.', 'Third sentence.']
+    assert hits[0].score == hits[0].nuance_score == 0.6
+    assert hits[0].semantic_score == 0.3
+    assert 'Only 2 matching candidates' in messages[-1]
+    with pytest.raises(ValueError, match='No retrieved references meet.*Reduce.*expand the corpus'):
+        index.search('query', encoder, reranker=Reranker(), min_semantic_score=0.9)
+    # Explicitly disabling acceptance returns the original ranking unchanged.
+    assert index.search('query', encoder, reranker=Reranker())[0].text == 'First sentence.'
+
+
+@pytest.mark.parametrize('reranker', [None, SimpleNamespace(score=lambda *args, **kwargs: [0.7])])
+def test_semantic_threshold_requires_component_scores(tmp_path, reranker):
+    with pytest.raises(ValueError, match='requires nuance reranking'):
+        CorpusIndex(tmp_path).search('query', FakeEncoder(), reranker=reranker, min_semantic_score=0.3)
+
+
+@pytest.mark.parametrize('option', ['min_length_ratio', 'min_semantic_score', 'max_contradiction_score'])
+@pytest.mark.parametrize('value', [-0.1, 1.1, float('nan')])
+def test_invalid_quality_retrieval_settings_rejected(tmp_path, option, value):
+    with pytest.raises(ValueError, match='between zero and one'):
+        CorpusIndex(tmp_path).search('query', FakeEncoder(), **{option: value})
+
+
+@pytest.mark.parametrize('max_sentences,expected_error', [(1, 'assessed sentence span'), (2, 'considered sentence window')])
+def test_quality_audit_budgets_include_excluded_spans_and_preserve_cache(tmp_path, monkeypatch, max_sentences, expected_error):
+    from modules.sentence_rewrite import corpus
+
+    source = tmp_path / 'a.txt'
+    source.write_text('A usable sentence.', encoding='utf-8')
+    encoder = FakeEncoder()
+    index = CorpusIndex(tmp_path / 'cache')
+    config = CorpusConfig(str(source), max_sentences=max_sentences)
+    before = index.build(config, encoder)
+    before_bytes = index.path.read_bytes()
+    monkeypatch.setattr(corpus, 'MAX_WINDOWS', 3)
+    source.write_text('Broken \ufffd first. Broken \ufffd second. Broken \ufffd third. Broken \ufffd fourth.', encoding='utf-8')
+    with pytest.raises(CorpusQualityError, match=expected_error) as error:
+        index.build(config, encoder)
+    assert error.value.quality_report['analyzed_spans'] <= 3
+    assert index.path.read_bytes() == before_bytes
+    assert index.manifest == before
+    assert encoder.encoded == 1
+    assert not list(index.cache_dir.glob('.building-*'))
+
+
+def test_contradiction_cutoff_blocks_wrong_roles_despite_high_semantic_score(tmp_path):
+    source = tmp_path / 'a.txt'
+    source.write_text('The dog chased the man. The man pursued the dog.', encoding='utf-8')
+    encoder = FakeEncoder()
+    index = CorpusIndex(tmp_path / 'cache')
+    index.build(CorpusConfig(str(source), max_sentences=1), encoder)
+
+    class Reranker:
+        def score_details(self, query, texts, **kwargs):
+            return [dict(score=0.9 if text.startswith('The dog') else 0.8, semantic_score=0.8,
+                         entailment_score=0.5, contradiction_score=0.99 if text.startswith('The dog') else 0.8)
+                    for text in texts]
+
+    query = 'A man chased a dog.'
+    default = index.search(query, encoder, reranker=Reranker(), min_semantic_score=0.3)
+    assert default[0].text == 'The dog chased the man.'
+    guarded = index.search(query, encoder, reranker=Reranker(), min_semantic_score=0.3, max_contradiction_score=0.8)
+    assert [hit.text for hit in guarded] == ['The man pursued the dog.']
+    assert guarded[0].score == guarded[0].semantic_score == guarded[0].contradiction_score == 0.8
+    with pytest.raises(ValueError, match='No retrieved references meet.*maximum contradiction score'):
+        index.search(query, encoder, reranker=Reranker(), max_contradiction_score=0.7)
+
+
+@pytest.mark.parametrize('reranker', [None, SimpleNamespace(score=lambda *args, **kwargs: [0.7])])
+def test_contradiction_threshold_requires_component_scores(tmp_path, reranker):
+    with pytest.raises(ValueError, match='requires nuance reranking'):
+        CorpusIndex(tmp_path).search('query', FakeEncoder(), reranker=reranker, max_contradiction_score=0.8)

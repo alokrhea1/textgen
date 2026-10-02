@@ -12,10 +12,11 @@ from dataclasses import asdict, dataclass
 from collections import deque
 from pathlib import Path
 from .cleanup import CLEANUP_VERSION, MODES, clean_text
+from .quality import QUALITY_POLICIES, QUALITY_VERSION, assess_span, quality_exclusions
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_CORPUS_BYTES = 512 * 1024 * 1024
 MAX_WINDOWS = 200000
@@ -32,6 +33,7 @@ class CorpusConfig:
     max_sentences: int = 3
     cleanup: str = 'conservative'
     join_hyphenated_lines: bool = False
+    quality_policy: str = 'balanced'
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,21 @@ class RetrievalHit:
     semantic_score: float | None = None
     entailment_score: float | None = None
     contradiction_score: float | None = None
+    content_token_count: int | None = None
+    quality_flags: tuple = ()
+    word_count: int | None = None
+
+
+class CorpusQualityError(ValueError):
+    """A failed build whose candidate-quality audit remains useful to the UI."""
+
+    def __init__(self, message, quality_report):
+        super().__init__(message)
+        self.quality_report = quality_report
+
+
+class _OldCorpusSchemaError(ValueError):
+    pass
 
 
 def _matrix(value):
@@ -72,6 +89,8 @@ def _sources(config, progress, cancel_event=None):
         raise ValueError('Maximum sentence window must be between 1 and 20.')
     if config.cleanup not in MODES:
         raise ValueError('Invalid corpus cleanup mode.')
+    if config.quality_policy not in QUALITY_POLICIES:
+        raise ValueError('Corpus quality policy must be balanced or off.')
     paths = [Path(x.strip()).expanduser().absolute() for x in config.paths.splitlines() if x.strip()]
     if not paths:
         raise ValueError('Enter at least one local text file or directory.')
@@ -155,9 +174,13 @@ class CorpusIndex:
                 if not isinstance(signature['files'], list) or not isinstance(signature['encoder'], dict):
                     raise ValueError('Invalid cache signature')
                 CorpusConfig(**signature['config'])
+                if signature['schema'] == 1 and signature['splitter'] == 'period-spans-v1':
+                    raise _OldCorpusSchemaError('Corpus index uses an older schema; rebuild the index to apply ingestion quality screening.')
                 if signature['schema'] != SCHEMA_VERSION or signature['splitter'] != 'period-spans-v1':
                     raise ValueError('Unsupported cache schema')
                 return result
+        except _OldCorpusSchemaError:
+            raise
         except (sqlite3.Error, ValueError, TypeError, KeyError) as exc:
             raise ValueError('Corpus cache is corrupt; rebuild the index.') from exc
 
@@ -167,7 +190,7 @@ class CorpusIndex:
 
     def _signature(self, config, encoder, progress, cancel_event=None):
         return {'schema': SCHEMA_VERSION, 'splitter': 'period-spans-v1',
-                'cleanup_version': CLEANUP_VERSION,
+                'cleanup_version': CLEANUP_VERSION, 'quality_version': QUALITY_VERSION,
                 'config': asdict(config), 'encoder': _identity(encoder), 'files': _sources(config, progress, cancel_event)}
 
     def assert_current(self, config, encoder, progress=None, cancel_event=None):
@@ -192,6 +215,9 @@ class CorpusIndex:
             signature = self._signature(config, encoder, progress)
             try:
                 previous = self.manifest
+            except _OldCorpusSchemaError:
+                progress('Rebuilding the older corpus index for ingestion quality screening.')
+                previous = None
             except ValueError:
                 if not force:
                     raise
@@ -205,8 +231,19 @@ class CorpusIndex:
             try:
                 db = sqlite3.connect(staging)
                 os.chmod(staging, 0o600)
-                db.executescript('CREATE TABLE metadata(value TEXT); CREATE TABLE candidates(id INTEGER PRIMARY KEY, text TEXT UNIQUE, sentences INTEGER, tokens INTEGER, rows INTEGER, dims INTEGER, matrix BLOB); CREATE TABLE occurrences(candidate INTEGER, source TEXT, start INTEGER, end INTEGER); CREATE INDEX occurrence_candidate ON occurrences(candidate);')
+                db.executescript('''
+                    CREATE TABLE metadata(value TEXT);
+                    CREATE TABLE candidates(id INTEGER PRIMARY KEY, text TEXT UNIQUE,
+                        sentences INTEGER, tokens INTEGER, content_tokens INTEGER,
+                        word_count INTEGER, letter_count INTEGER, rows INTEGER, dims INTEGER, matrix BLOB);
+                    CREATE TABLE occurrences(candidate INTEGER, source TEXT, start INTEGER, end INTEGER,
+                        quality_flags TEXT, context_before TEXT, context_after TEXT);
+                    CREATE INDEX occurrence_candidate ON occurrences(candidate);
+                    CREATE TABLE excluded_spans(source TEXT, start INTEGER, end INTEGER, text TEXT,
+                        flags TEXT, reasons TEXT, context_before TEXT, context_after TEXT);
+                ''')
                 occurrence_count = 0
+                considered_windows = 0
                 unique_count = 0
                 max_tokens = encoder.config.max_tokens
                 batch_size = encoder.config.batch_size
@@ -214,6 +251,10 @@ class CorpusIndex:
                 embedding_dimension = None
                 matrix_bytes = 0
                 cleanup_reports = []
+                token_overhead = encoder.token_count('')
+                quality_report = dict(version=QUALITY_VERSION, policy=config.quality_policy,
+                                      analyzed_spans=0, excluded_spans=0, excluded_windows=0,
+                                      flag_counts={}, excluded_reasons={}, samples=[])
 
                 def flush():
                     nonlocal unique_count, embedding_dimension, matrix_bytes
@@ -232,9 +273,10 @@ class CorpusIndex:
                         matrix_bytes += matrix.nbytes
                         if matrix_bytes > MAX_INDEX_BYTES:
                             raise ValueError(f'Corpus matrices exceed the {MAX_INDEX_BYTES} byte index budget; reduce corpus or sentence windows.')
-                        text, count, tokens, occurrences = item
-                        cursor = db.execute('INSERT INTO candidates(text,sentences,tokens,rows,dims,matrix) VALUES(?,?,?,?,?,?)', (text, count, tokens, *matrix.shape, matrix.tobytes()))
-                        db.executemany('INSERT INTO occurrences VALUES(?,?,?,?)', [(cursor.lastrowid, *o) for o in occurrences])
+                        text, count, tokens, occurrences, words, letters = item
+                        cursor = db.execute('INSERT INTO candidates(text,sentences,tokens,content_tokens,word_count,letter_count,rows,dims,matrix) VALUES(?,?,?,?,?,?,?,?,?)',
+                                            (text, count, tokens, max(0, tokens - token_overhead), words, letters, *matrix.shape, matrix.tobytes()))
+                        db.executemany('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?)', [(cursor.lastrowid, *o) for o in occurrences])
                     unique_count += len(pending)
                     db.commit()
                     pending.clear()
@@ -253,7 +295,50 @@ class CorpusIndex:
                     text = cleaned.text
                     cleanup_reports.append({'source': source['path'], **cleaned.report})
                     progress(f'Cleanup {source["path"]}: {cleaned.report["changes"]} changes ({config.cleanup}).' + (' ' + cleaned.report['warning'] if cleaned.report['warning'] else ''))
-                    spans = iter(iter_sentence_spans(text))
+                    def assessed_spans():
+                        spans = iter(iter_sentence_spans(text))
+                        previous_span = None
+                        current_span = next(spans, None)
+                        while current_span is not None:
+                            following_span = next(spans, None)
+                            quality = assess_span(text, current_span, previous_span, following_span, config.cleanup)
+                            exclusions = quality_exclusions(quality, config.quality_policy)
+                            if quality_report['analyzed_spans'] >= MAX_WINDOWS:
+                                raise CorpusQualityError(f'Corpus exceeds the {MAX_WINDOWS} assessed sentence span limit; reduce the corpus and rebuild.', quality_report)
+                            quality_report['analyzed_spans'] += 1
+                            if quality_report['analyzed_spans'] % 1000 == 0:
+                                progress(f'Assessing corpus sentence quality: {quality_report["analyzed_spans"]} spans checked; {quality_report["excluded_spans"]} excluded.')
+                            for flag in quality.flags:
+                                counts = quality_report['flag_counts']
+                                counts[flag] = counts.get(flag, 0) + 1
+                            if quality.flags:
+                                raw_start, raw_end = cleaned.source_span(current_span.start, current_span.end)
+                                context_before = text[max(0, current_span.start - 200):current_span.start].strip()
+                                context_after = text[current_span.end:current_span.end + 200].strip()
+                                sample = dict(source=source['path'], start=raw_start, end=raw_end,
+                                              text=current_span.text[:500], flags=list(quality.flags),
+                                              reasons=list(exclusions), context_before=context_before, context_after=context_after)
+                                samples = quality_report['samples']
+                                if len(samples) < 10:
+                                    samples.append(sample)
+                                elif exclusions:
+                                    # Prioritize exclusions without hiding retained flags when
+                                    # screening is off or all candidates remain usable.
+                                    replace = next((i for i in reversed(range(len(samples))) if not samples[i]['reasons']), None)
+                                    if replace is not None:
+                                        samples[replace] = sample
+                            if exclusions:
+                                quality_report['excluded_spans'] += 1
+                                for reason in exclusions:
+                                    counts = quality_report['excluded_reasons']
+                                    counts[reason] = counts.get(reason, 0) + 1
+                                db.execute('INSERT INTO excluded_spans VALUES(?,?,?,?,?,?,?,?)',
+                                           (source['path'], raw_start, raw_end, current_span.text,
+                                            json.dumps(quality.flags), json.dumps(exclusions), context_before, context_after))
+                            yield current_span, quality, exclusions
+                            previous_span, current_span = current_span, following_span
+
+                    spans = iter(assessed_spans())
                     lookahead = deque()
                     def fill():
                         while len(lookahead) < config.max_sentences:
@@ -263,30 +348,47 @@ class CorpusIndex:
                             lookahead.append(next_span)
                     fill()
                     while lookahead:
-                        span = lookahead[0]
-                        if encoder.token_count(span.text) > max_tokens:
+                        span, _, exclusions = lookahead[0]
+                        if not exclusions and encoder.token_count(span.text) > max_tokens:
                             raw_start, _ = cleaned.source_span(span.start, span.end)
                             raise ValueError(f'Sentence at offset {raw_start} in {source["path"]} exceeds embedding token limit {max_tokens}.')
-                        for count, ending in enumerate(lookahead, 1):
+                        blocked = False
+                        words = letters = 0
+                        flags = set()
+                        for count, (ending, quality, exclusions) in enumerate(lookahead, 1):
+                            considered_windows += 1
+                            if considered_windows > MAX_WINDOWS:
+                                raise CorpusQualityError(f'Corpus exceeds the {MAX_WINDOWS} considered sentence window limit, including excluded windows; reduce the corpus or maximum sentence window and rebuild.', quality_report)
+                            blocked = blocked or bool(exclusions)
+                            if blocked:
+                                quality_report['excluded_windows'] += 1
+                                continue
+                            words += quality.word_count
+                            letters += quality.letter_count
+                            flags.update(quality.flags)
                             end = ending.end
                             candidate = text[span.start:end]
                             tokens = encoder.token_count(candidate)
                             if tokens > max_tokens:
-                                break
+                                continue
                             occurrence_count += 1
                             if occurrence_count > MAX_WINDOWS:
                                 raise ValueError(f'Corpus exceeds {MAX_WINDOWS} candidate occurrences.')
                             raw_start, raw_end = cleaned.source_span(span.start, end)
-                            occurrence = (source['path'], raw_start, raw_end)
+                            window_flags = sorted(flags - {'short_reference'})
+                            if words <= 4 and letters <= 24:
+                                window_flags.append('short_reference')
+                            occurrence = (source['path'], raw_start, raw_end, json.dumps(window_flags),
+                                          text[max(0, span.start - 200):span.start].strip(), text[end:end + 200].strip())
                             existing = db.execute('SELECT id FROM candidates WHERE text=?', (candidate,)).fetchone()
                             if existing:
-                                db.execute('INSERT INTO occurrences VALUES(?,?,?,?)', (existing[0], *occurrence))
+                                db.execute('INSERT INTO occurrences VALUES(?,?,?,?,?,?,?)', (existing[0], *occurrence))
                             else:
                                 match = next((item for item in pending if item[0] == candidate), None)
                                 if match:
                                     match[3].append(occurrence)
                                 else:
-                                    pending.append((candidate, count, tokens, [occurrence]))
+                                    pending.append((candidate, count, tokens, [occurrence], words, letters))
                                 if len(pending) >= batch_size:
                                     flush()
                         lookahead.popleft()
@@ -294,10 +396,13 @@ class CorpusIndex:
                     db.commit()
                 flush()
                 if not unique_count:
+                    if quality_report['excluded_spans']:
+                        raise CorpusQualityError('All complete corpus sentence spans were excluded by ingestion quality screening. Inspect the quality report and source text, choose another corpus, or set screening to off to retain flagged spans.', quality_report)
                     raise ValueError('Corpus contains no complete period-terminated sentences.')
                 if self._signature(config, encoder, progress) != signature:
                     raise ValueError('Corpus files or embedding identity changed during indexing; retry.')
                 result = {'signature': signature, 'files': len(signature['files']), 'candidates': unique_count, 'occurrences': occurrence_count, 'matrix_bytes': matrix_bytes, 'generation': uuid.uuid4().hex}
+                result['quality'] = quality_report
                 cleanup_totals = {}
                 cleanup_samples = {}
                 for report in cleanup_reports:
@@ -332,11 +437,15 @@ class CorpusIndex:
     def search(self, query, encoder, top_k=5, length_mode='sentences', sentence_count=1,
                token_tolerance=0.15, token_counter=None, scoring='symmetric', diversity=0.0,
                exclude_exact=True, progress=None, reranker=None, rerank_pool=50, cancel_event=None,
-               token_counter_key=None):
+               token_counter_key=None, min_length_ratio=0.0, min_semantic_score=0.0,
+               max_contradiction_score=1.0):
         """Scan all eligible matrices; optionally rerank the exact top pool.
 
         Hit.score is raw relevance before diversity (nuance score when enabled), while
         late_score and nuance_score retain the unmodified backend scores.
+        Sentence-mode length eligibility uses embedding content tokens before pooling;
+        token mode retains its native generator-token tolerance. Acceptance cutoffs
+        apply to reranker components, not calibrated relevance probabilities.
         """
         from .embeddings import score_many
         progress = progress or (lambda _: None)
@@ -344,8 +453,12 @@ class CorpusIndex:
             scoring = 'query'
         if not 1 <= top_k <= 50 or length_mode not in ('sentences', 'tokens') or scoring not in ('symmetric', 'query'):
             raise ValueError('Invalid retrieval options.')
-        if not isinstance(rerank_pool, int) or not 1 <= rerank_pool <= 500:
-            raise ValueError('Nuance reranking pool must be between 1 and 500.')
+        if not isinstance(rerank_pool, int) or not 1 <= rerank_pool <= 2000:
+            raise ValueError('Nuance reranking pool must be between 1 and 2000.')
+        if not all(0 <= value <= 1 for value in (min_length_ratio, min_semantic_score, max_contradiction_score)):
+            raise ValueError('Length ratio and semantic/contradiction thresholds must be between zero and one.')
+        if (min_semantic_score or max_contradiction_score < 1) and not callable(getattr(reranker, 'score_details', None)):
+            raise ValueError('Reference acceptance requires nuance reranking with semantic and contradiction score components. Enable nuance reranking or disable acceptance by setting the minimum semantic score to zero and maximum contradiction score to one.')
         def check_cancelled():
             if cancel_event is not None and cancel_event.is_set():
                 raise ValueError('Corpus retrieval cancelled.')
@@ -364,6 +477,8 @@ class CorpusIndex:
             if length_mode == 'tokens' and token_counter is None:
                 raise ValueError('Token-length retrieval requires the generator token counter.')
             target_tokens = token_counter(query) if length_mode == 'tokens' else None
+            min_content_tokens = (min_length_ratio * max(0, encoder.token_count(query) - encoder.token_count(''))
+                                  if length_mode == 'sentences' and min_length_ratio else 0)
             query_matrix = _matrix(encoder.encode_query(query) if scoring == 'query' else encoder.encode_sentence(query))
             key = (manifest.get('generation'), token_counter_key)
             if token_counter_key is None or key != self._token_length_key:
@@ -387,8 +502,8 @@ class CorpusIndex:
                     score = float(score)
                     if not np.isfinite(score):
                         raise ValueError('Retrieval score is not finite.')
-                    identifier, text, count, tokens = metadata
-                    entry = (score, -identifier, identifier, text, count, tokens)
+                    identifier, text, count, tokens, content_tokens, word_count = metadata
+                    entry = (score, -identifier, identifier, text, count, tokens, content_tokens, word_count)
                     if len(heap) < pool_size:
                         heapq.heappush(heap, entry)
                     elif entry[:2] > heap[0][:2]:
@@ -396,17 +511,19 @@ class CorpusIndex:
                 scoring_batch.clear()
                 scoring_tokens = 0
             with sqlite3.connect(self.path) as db:
-                sql = 'SELECT id,text,sentences,tokens,rows,dims FROM candidates'
+                sql = 'SELECT id,text,sentences,tokens,content_tokens,word_count,rows,dims FROM candidates'
                 parameters = ()
                 if length_mode == 'sentences':
                     sql += ' WHERE sentences=?'
                     parameters = (sentence_count,)
                 for index, row in enumerate(db.execute(sql, parameters), 1):
                     check_cancelled()
-                    identifier, text, count, tokens, rows, dims = row
+                    identifier, text, count, tokens, content_tokens, word_count, rows, dims = row
                     if exclude_exact and text.strip() == query.strip():
                         continue
                     if length_mode == 'sentences' and count != sentence_count:
+                        continue
+                    if length_mode == 'sentences' and content_tokens < min_content_tokens:
                         continue
                     if length_mode == 'tokens':
                         if identifier not in self._token_lengths:
@@ -422,7 +539,7 @@ class CorpusIndex:
                         raise ValueError('Cached embedding dimensions changed; rebuild the index.')
                     if scoring_batch and (len(scoring_batch) >= 64 or scoring_tokens + rows > 16384):
                         flush_scores()
-                    scoring_batch.append(((identifier, text, count, tokens), matrix))
+                    scoring_batch.append(((identifier, text, count, tokens, content_tokens, word_count), matrix))
                     scoring_tokens += rows
                     if index % 100 == 0:
                         progress(f'Scoring candidate {index}/{manifest["candidates"]}')
@@ -458,6 +575,12 @@ class CorpusIndex:
                     nuance_scores = {item[2]: float(score) for item, score in zip(ranked, scores)}
                     # Python's stable sort preserves late-score ordering on ties.
                     ranked.sort(key=lambda item: nuance_scores[item[2]], reverse=True)
+                    if min_semantic_score or max_contradiction_score < 1:
+                        ranked = [item for item in ranked
+                                  if nuance_details[item[2]]['semantic_score'] >= min_semantic_score
+                                  and nuance_details[item[2]]['contradiction_score'] <= max_contradiction_score]
+                        if not ranked:
+                            raise ValueError('No retrieved references meet the semantic and contradiction thresholds. Reduce the minimum semantic score, increase the maximum contradiction score or reranking pool, or expand the corpus; no weak references were substituted.')
                 selected = []
                 while ranked and len(selected) < top_k:
                     if selected and diversity:
@@ -471,15 +594,17 @@ class CorpusIndex:
                         chosen = ranked.pop(0)
                     selected.append(chosen)
                 hits = []
-                for score, _, identifier, text, count, tokens in selected:
+                for score, _, identifier, text, count, tokens, content_tokens, word_count in selected:
                     origins = tuple(db.execute('SELECT source,start,end FROM occurrences WHERE candidate=? ORDER BY source,start', (identifier,)))
+                    flags = tuple(sorted({flag for row in db.execute('SELECT quality_flags FROM occurrences WHERE candidate=?', (identifier,))
+                                          for flag in json.loads(row[0])}))
                     source, start, end = origins[0]
                     components = nuance_details.get(identifier, {})
                     hits.append(RetrievalHit(text, source, start, end, count, tokens,
                                              nuance_scores.get(identifier, score), origins,
                                              late_scores[identifier], nuance_scores.get(identifier),
                                              components.get('semantic_score'), components.get('entailment_score'),
-                                             components.get('contradiction_score')))
+                                             components.get('contradiction_score'), content_tokens, flags, word_count))
                 warning = f' Only {len(hits)} matching candidates available for requested {top_k}.' if len(hits) < top_k else ''
                 progress('Retrieval complete.' + warning + (' Diversity uses textual word overlap.' if diversity else ''))
                 return hits

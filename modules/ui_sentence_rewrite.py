@@ -15,6 +15,7 @@ from modules.logging_colors import logger
 from modules.sentence_rewrite.corpus import CorpusConfig, CorpusIndex
 from modules.sentence_rewrite.embeddings import DEFAULT_MODEL, FAST_MODEL, EmbeddingConfig, LateInteractionEncoder
 from modules.sentence_rewrite.engine import generate_rewrite
+from modules.sentence_rewrite.quality import QUALITY_REASONS
 from modules.sentence_rewrite.reranker import NuanceReranker
 from modules.sentence_rewrite.sentences import last_sentence, replace_sentence
 
@@ -77,7 +78,8 @@ def _default_embedding_device():
 
 def _defaults(mode):
     values = dict(paths='', recursive=True, model=DEFAULT_MODEL, revision='', device=_default_embedding_device(),
-                  max_tokens=256, batch_size=16, local_files_only=False, max_sentences=3, cleanup='conservative', join_hyphenated_lines=False)
+                  max_tokens=256, batch_size=16, local_files_only=False, max_sentences=3, cleanup='conservative',
+                  join_hyphenated_lines=False, quality_policy='balanced')
     if not shared.args.multi_user:
         try:
             saved = json.loads(_settings_path(mode).read_text(encoding='utf-8'))
@@ -88,9 +90,9 @@ def _defaults(mode):
 
 
 def _configs(values):
-    paths, recursive, model, revision, device, max_tokens, batch_size, offline, max_sentences, cleanup, join_hyphenated_lines = values
+    paths, recursive, model, revision, device, max_tokens, batch_size, offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy = values
     return (CorpusConfig(paths=paths, recursive=recursive, max_sentences=int(max_sentences),
-                         cleanup=cleanup, join_hyphenated_lines=bool(join_hyphenated_lines)),
+                         cleanup=cleanup, join_hyphenated_lines=bool(join_hyphenated_lines), quality_policy=quality_policy),
             EmbeddingConfig(model=model, revision=revision, device=device, max_tokens=int(max_tokens),
                             batch_size=int(batch_size), local_files_only=offline))
 
@@ -118,10 +120,30 @@ def _evidence(hits, length_mode='sentences'):
                     parts.append(f'{label} {value:.4f}')
             return ' | '.join(parts)
         return f'Late interaction {hit.score:.4f}'
+
+    def quality(hit):
+        flags = getattr(hit, 'quality_flags', ()) or ()
+        if not flags:
+            return ''
+        lines = []
+        for flag in flags[:8]:
+            description = str(QUALITY_REASONS.get(flag, str(flag).replace('_', ' ')))
+            description = description[:240] + ('…' if len(description) > 240 else '')
+            if flag == 'short_reference':
+                label = 'Quality note'
+            elif flag in QUALITY_REASONS:
+                label = 'Quality warning (suspected damage; inspect source)'
+            else:
+                label = 'Quality flag'
+            lines.append(f'{label}: {description}')
+        if len(flags) > 8:
+            lines.append('Additional quality flags omitted.')
+        return '\n' + '\n'.join(lines)
+
     return '\n\n'.join(
         f'{i}. {score(hit)} | {hit.sentence_count} sentence(s) | '
         f'{hit.token_count} {"generation" if length_mode == "tokens" else "embedding"} tokens\n'
-        f'{hit.source} [{hit.start}:{hit.end}]\n{hit.text}'
+        f'{hit.source} [{hit.start}:{hit.end}]{quality(hit)}\n{hit.text}'
         for i, hit in enumerate(hits, 1)
     )
 
@@ -148,6 +170,39 @@ def _cleanup_report(report):
         lines.extend([f"Sample {i}: {bounded(sample.get('source', ''))}",
                       f"Before: {bounded(sample.get('before', ''))}",
                       f"After: {bounded(sample.get('after', ''))}"])
+    if len(samples) > 3:
+        lines.append('Additional samples omitted.')
+    return '\n'.join(lines)
+
+
+def _quality_report(report):
+    if not report:
+        return 'No ingestion quality report is available for this corpus.'
+
+    def bounded(value):
+        value = str(value)
+        return value[:240] + ('…' if len(value) > 240 else '')
+
+    lines = [f"Quality policy: {report.get('policy', 'unknown')}",
+             f"Sentence spans analyzed: {report.get('analyzed_spans', 0)}",
+             f"Sentence spans excluded: {report.get('excluded_spans', 0)}",
+             f"Candidate windows excluded: {report.get('excluded_windows', 0)}",
+             'Flags identify possible problems; source text is preserved. Locations refer to original decoded characters.']
+    if report.get('policy') == 'off':
+        lines.append('Quality exclusions are disabled. Flagged passages may remain in the corpus.')
+    for name, count in sorted(report.get('flag_counts', {}).items()):
+        lines.append(f"Flag — {name.replace('_', ' ')}: {count}")
+    for name, count in sorted(report.get('excluded_reasons', {}).items()):
+        lines.append(f"Excluded — {name.replace('_', ' ')}: {count}")
+    samples = sorted(report.get('samples', []), key=lambda sample: not bool(sample.get('reasons')))
+    for i, sample in enumerate(samples[:3], 1):
+        lines.extend([f"Sample {i}: {bounded(sample.get('source', ''))} [{sample.get('start', '?')}:{sample.get('end', '?')}]",
+                      f"Flags: {bounded(', '.join(sample.get('flags', [])))}",
+                      f"Exclusion reasons: {bounded(', '.join(sample.get('reasons', []))) or 'none'}",
+                      f"Text: {bounded(sample.get('text', ''))}"])
+        for field, label in [('context_before', 'Before'), ('context_after', 'After')]:
+            if sample.get(field):
+                lines.append(f"{label}: {bounded(sample[field])}")
     if len(samples) > 3:
         lines.append('Additional samples omitted.')
     return '\n'.join(lines)
@@ -198,12 +253,18 @@ def create_ui(mode='notebook'):
             control('join_hyphenated_lines', gr.Checkbox(label='Join words hyphenated across lines',
                                                        value=defaults['join_hyphenated_lines'],
                                                        info='Optional and off by default to protect intentional compound words. Source locations refer to original decoded characters.'))
+            control('quality_policy', gr.Dropdown(label='Ingestion quality screening',
+                                                 choices=['balanced', 'off'], value=defaults['quality_policy'],
+                                                 info='Balanced excludes passages with suspected damage before embedding. Off keeps flagged passages. Reports retain original source locations; changing this setting requires rebuilding.'))
         with gr.Row():
             control('top_k', gr.Slider(1, 50, step=1, value=5, label='Top K references'))
             control('length_mode', gr.Radio(['sentences', 'tokens'], value='sentences', label='Match length by'))
             control('sentence_count', gr.Slider(1, 8, step=1, value=1, label='Sentences per reference'))
             control('token_tolerance', gr.Slider(0, 1, step=0.05, value=0.15,
                                                 label='Generation-token length tolerance', info='0 = exactly the query token count.'))
+        control('min_length_ratio', gr.Slider(0, 1, step=0.05, value=0.5,
+                                            label='Minimum reference length relative to target',
+                                            info='Sentence mode only: compare embedding content-token counts. 0.5 requires at least half the target length; 0 disables this filter. Token mode uses the generation-token tolerance.'))
         with gr.Row():
             control('scoring', gr.Radio(['symmetric', 'directional'], value='symmetric', label='Late-interaction score',
                                         info='Symmetric compares whole sentences; directional uses trained query/document roles.'))
@@ -215,6 +276,12 @@ def create_ui(mode='notebook'):
                                          info='Combine pairwise semantic similarity (STS) with NLI entailment and contradiction checks. Useful for negation and who did what to whom.'))
             control('rerank_pool', gr.Slider(5, 500, step=5, value=200, label='Late-interaction candidates to rerank',
                                             info='A larger pool gives the nuance model more alternatives.'))
+        control('min_semantic_score', gr.Slider(0, 1, step=0.05, value=0.3,
+                                              label='Minimum semantic similarity',
+                                              info='Requires meaning and nuance reranking. English STS scores are heuristic, not confidence percentages. Lower the minimum for indirect style matches or multilingual text; 0 disables this filter. May return fewer than K references or fail if none qualify.'))
+        control('max_contradiction_score', gr.Slider(0, 1, step=0.05, value=0.8,
+                                                   label='Maximum contradiction score',
+                                                   info='Requires meaning and nuance reranking. English NLI scores are heuristic. Reject references that strongly contradict the target; increase for indirect style matches or multilingual text. 1 disables this filter.'))
         control('seed', gr.Textbox(label='Optional seed sentence', lines=2,
                                   info='Leave blank to use the notebook’s last period-completed sentence. A seed guides its replacement.'))
         control('guidance', gr.Textbox(label='Optional writing guidance', lines=2,
@@ -231,6 +298,7 @@ def create_ui(mode='notebook'):
             control('undo', gr.Button('Undo rewrite', interactive=False))
         c['status'] = gr.Textbox(label='Status', value='Choose local text files, then build the corpus.', interactive=False)
         c['cleanup_report'] = gr.Textbox(label='Cleanup report', interactive=False, lines=7)
+        c['quality_report'] = gr.Textbox(label='Ingestion quality report', interactive=False, lines=10)
         c['target'] = gr.Textbox(label='Sentence used for retrieval', interactive=False, lines=2)
         c['result'] = gr.Textbox(label='Proposed replacement', interactive=False, lines=3)
         c['references'] = gr.Textbox(label='Retrieved references and sources', interactive=False, lines=10)
@@ -243,9 +311,9 @@ def create_ui(mode='notebook'):
 def create_event_handlers(mode='notebook'):
     c, controls = shared.gradio[f'rewrite-ui-{mode}']
     session = c['session']
-    config_names = ['paths', 'recursive', 'model', 'revision', 'device', 'max_tokens', 'batch_size', 'local_files_only', 'max_sentences', 'cleanup', 'join_hyphenated_lines']
+    config_names = ['paths', 'recursive', 'model', 'revision', 'device', 'max_tokens', 'batch_size', 'local_files_only', 'max_sentences', 'cleanup', 'join_hyphenated_lines', 'quality_policy']
     config_inputs = [c[x] for x in config_names]
-    outputs = [session, c['status'], c['target'], c['result'], c['references'], c['cleanup_report'], *controls]
+    outputs = [session, c['status'], c['target'], c['result'], c['references'], c['cleanup_report'], c['quality_report'], *controls]
     notebook = shared.gradio['textbox-notebook' if mode == 'notebook' else 'output_textbox']
     input_text = shared.gradio['textbox-notebook' if mode == 'notebook' else 'textbox-default']
     prompt = shared.gradio[f'prompt_menu-{mode}']
@@ -263,7 +331,7 @@ def create_event_handlers(mode='notebook'):
         return value
 
     def build(s, paths, recursive, model, revision, device, max_tokens, batch_size,
-              offline, max_sentences, cleanup, join_hyphenated_lines, force, progress=gr.Progress()):
+              offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy, force, progress=gr.Progress()):
         if not s.lock.acquire(blocking=False):
             yield {c['status']: 'Another corpus operation is already running.'}
             return
@@ -271,11 +339,12 @@ def create_event_handlers(mode='notebook'):
         encoder = None
         committed = False
         cleanup_report = None
+        quality_report = None
         try:
             yield updates(s, 'Building corpus. Controls are locked until indexing succeeds or fails.', locked=True)
             _guard()
             corpus_config, embedding_config = _configs([paths, recursive, model, revision, device,
-                                                        max_tokens, batch_size, offline, max_sentences, cleanup, join_hyphenated_lines])
+                                                        max_tokens, batch_size, offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy])
             key = hashlib.sha256(json.dumps([asdict(corpus_config), asdict(embedding_config)], sort_keys=True).encode()).hexdigest()
             index = CorpusIndex(shared.user_data_dir / 'retrieval_indexes' / key)
             s.build_path = index.path
@@ -292,6 +361,7 @@ def create_event_handlers(mode='notebook'):
             s.config, s.embedding_config = corpus_config, embedding_config
             committed = True
             cleanup_report = _cleanup_report(manifest.get('cleanup'))
+            quality_report = _quality_report(manifest.get('quality'))
             saved = {**asdict(corpus_config), **asdict(embedding_config)}
             path = _settings_path(mode)
             tmp = path.with_suffix(f'.{uuid.uuid4().hex}.tmp')
@@ -312,6 +382,11 @@ def create_event_handlers(mode='notebook'):
         except Exception as exc:
             logger.exception('Notebook corpus indexing failed')
             message = f'INDEX BUILD FAILED: {exc}\nCorrect the path/settings and click Build corpus / retry.'
+            rejected_report = getattr(exc, 'quality_report', None)
+            if rejected_report is not None:
+                quality_report = 'Failed build — no new corpus was published.\n' + _quality_report(rejected_report)
+                message += (f'\nQuality screening excluded {rejected_report.get("excluded_spans", 0)} sentence spans '
+                            f'and {rejected_report.get("excluded_windows", 0)} candidate windows. See the ingestion quality report.')
             if s.index is not None:
                 message += '\nThe previous completed corpus is retained; matching settings are required to use it.'
         finally:
@@ -325,10 +400,13 @@ def create_event_handlers(mode='notebook'):
         completed = updates(s, message)
         if cleanup_report is not None:
             completed[c['cleanup_report']] = cleanup_report
+        if quality_report is not None:
+            completed[c['quality_report']] = quality_report
         yield completed
 
     def run(s, text, left, prompt_name, state, seed, guidance, use_template, review, thinking,
             top_k, length_mode, sentence_count, token_tolerance, scoring, diversity, exclude_exact, nuance, rerank_pool,
+            min_length_ratio, min_semantic_score, max_contradiction_score,
             *settings, progress=gr.Progress(), generate=False):
         if not s.lock.acquire(blocking=False):
             yield {c['status']: 'Another corpus operation is already running.'}
@@ -376,14 +454,16 @@ def create_event_handlers(mode='notebook'):
                                   token_counter=token_counter, scoring=scoring, diversity=float(diversity),
                                   exclude_exact=exclude_exact, progress=lambda msg: progress(None, desc=msg),
                                   reranker=reranker, rerank_pool=int(rerank_pool), cancel_event=s.cancel,
-                                  token_counter_key=token_counter_key)
+                                  token_counter_key=token_counter_key, min_length_ratio=float(min_length_ratio),
+                                  min_semantic_score=float(min_semantic_score) if nuance else 0.0,
+                                  max_contradiction_score=float(max_contradiction_score) if nuance else 1.0)
             if s.cancel.is_set():
                 raise InterruptedError('Stopped before generation.')
             evidence = _evidence(hits, length_mode)
-            yield {c['target']: span.text, c['references']: evidence, c['result']: '',
-                   c['status']: f'Retrieved {len(hits)} references.'}
+            retrieved = f'Retrieved {len(hits)} of requested {int(top_k)} references.'
+            yield {c['target']: span.text, c['references']: evidence, c['result']: '', c['status']: retrieved}
             if not generate:
-                message = f'Retrieved {len(hits)} references. Click Rewrite to generate with the current settings.'
+                message = f'{retrieved} Click Rewrite to generate with the current settings.'
             else:
                 final = None
                 generation_state = state.copy()
@@ -420,21 +500,25 @@ def create_event_handlers(mode='notebook'):
 
     def search(s, text, left, prompt_name, state, seed, guidance, use_template, review, thinking,
                top_k, length_mode, sentence_count, token_tolerance, scoring, diversity, exclude_exact,
-               nuance, rerank_pool, paths, recursive, model, revision, device, max_tokens, batch_size,
-               offline, max_sentences, cleanup, join_hyphenated_lines, progress=gr.Progress()):
+               nuance, rerank_pool, min_length_ratio, min_semantic_score, max_contradiction_score,
+               paths, recursive, model, revision, device, max_tokens, batch_size,
+               offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy, progress=gr.Progress()):
         yield from run(s, text, left, prompt_name, state, seed, guidance, use_template, review, thinking,
                        top_k, length_mode, sentence_count, token_tolerance, scoring, diversity, exclude_exact,
-                       nuance, rerank_pool, paths, recursive, model, revision, device, max_tokens, batch_size,
-                       offline, max_sentences, cleanup, join_hyphenated_lines, progress=progress, generate=False)
+                       nuance, rerank_pool, min_length_ratio, min_semantic_score, max_contradiction_score,
+                       paths, recursive, model, revision, device, max_tokens, batch_size,
+                       offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy, progress=progress, generate=False)
 
     def rewrite(s, text, left, prompt_name, state, seed, guidance, use_template, review, thinking,
                 top_k, length_mode, sentence_count, token_tolerance, scoring, diversity, exclude_exact,
-                nuance, rerank_pool, paths, recursive, model, revision, device, max_tokens, batch_size,
-                offline, max_sentences, cleanup, join_hyphenated_lines, progress=gr.Progress()):
+                nuance, rerank_pool, min_length_ratio, min_semantic_score, max_contradiction_score,
+                paths, recursive, model, revision, device, max_tokens, batch_size,
+                offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy, progress=gr.Progress()):
         yield from run(s, text, left, prompt_name, state, seed, guidance, use_template, review, thinking,
                        top_k, length_mode, sentence_count, token_tolerance, scoring, diversity, exclude_exact,
-                       nuance, rerank_pool, paths, recursive, model, revision, device, max_tokens, batch_size,
-                       offline, max_sentences, cleanup, join_hyphenated_lines, progress=progress, generate=True)
+                       nuance, rerank_pool, min_length_ratio, min_semantic_score, max_contradiction_score,
+                       paths, recursive, model, revision, device, max_tokens, batch_size,
+                       offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy, progress=progress, generate=True)
 
     commit_outputs = [session, notebook, html_output, interface, c['status'], c['apply'], c['undo'], c['seed']]
     if mode == 'notebook':
@@ -519,13 +603,15 @@ def create_event_handlers(mode='notebook'):
             message += ' The disk cache remains available to another open Rewrite tab that is using it.'
         result = updates(s, message)
         result[c['cleanup_report']] = ''
+        result[c['quality_report']] = ''
         return result
 
     undo_inputs = [session, notebook, input_text, prompt, interface]
     commit_inputs = [*undo_inputs, c['seed']]
     run_inputs = [session, notebook, input_text, prompt, interface, c['seed'], c['guidance'], c['template'], c['review'], c['thinking'],
                   c['top_k'], c['length_mode'], c['sentence_count'], c['token_tolerance'], c['scoring'], c['diversity'], c['exclude_exact'],
-                  c['nuance'], c['rerank_pool'], *config_inputs]
+                  c['nuance'], c['rerank_pool'], c['min_length_ratio'], c['min_semantic_score'],
+                  c['max_contradiction_score'], *config_inputs]
     c['build'].click(build, [session, *config_inputs, c['force']], outputs, **queue_options)
     c['clear'].click(clear, session, outputs, **queue_options)
     c['search'].click(search, run_inputs, outputs, **queue_options)
