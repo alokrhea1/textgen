@@ -1,6 +1,6 @@
 # Notebook sentence rewriting
 
-The **Rewrite** subtab is available in both Notebook layouts. It retrieves examples from local text files and uses the currently loaded generation model to replace the last complete sentence. Retrieval and generation run only when requested; editing text never starts rewriting.
+The **Rewrite** subtab is available in both Notebook layouts. It retrieves examples from local text files and uses the currently loaded generation model to replace the last complete sentence. You can also opt into rewriting each newly completed sentence during Notebook generation. Editing text alone never starts generation or rewriting.
 
 ## Install and first use
 
@@ -42,6 +42,26 @@ Segmentation is deliberately period-based rather than linguistic. A terminating 
 Only the last completed span is replaced. Every character outside it—including an unfinished trailing fragment, whitespace, and following punctuation—is preserved exactly. The replacement must contain exactly one complete period-terminated sentence. During streaming the system waits for confirmation beyond the period, or validates completion when generation ends.
 
 An **Optional seed sentence** must itself be exactly one complete sentence. It temporarily substitutes for the target in the working document and becomes the retrieval query and generation target. It does not change the notebook until a successful rewrite is applied. The seed is cleared after application only if it has not changed since the rewrite began. **Optional writing guidance** steers composition; references are examples rather than instructions.
+
+## Automatic sentence rewriting during generation
+
+Build a corpus, then enable **Automatically retrieve and rewrite generated sentences** in the Notebook **Rewrite** subtab. The checkbox defaults to off and belongs to the current browser session; it is not saved as a corpus setting. With it enabled, **Generate** and **Shift+Enter** in either layout, single-column **Regenerate**, and two-column **Continue** draft one new completed sentence, retrieve references for it using the current Rewrite settings, rewrite it, and continue generation from the accepted rewritten document. Plain Enter inserts a newline; the existing Notebook shortcuts are preserved. The selected K, sentence/token matching, length and semantic acceptance settings, writing guidance, instruction-template selection, and rewrite thinking option all apply. The manual seed and **Review before applying** remain features of the manual Rewrite button and do not interrupt automatic generation.
+
+Existing completed sentences in the starting document remain unchanged. If that document ends in an unfinished sentence, the model first completes that sentence and rewrites the whole completed span. Its initially typed unfinished prefix may therefore change. The same period-based completion rules used by manual Rewrite apply; an exclamation mark or question mark alone does not trigger a rewrite.
+
+When **Use the selected instruction template** is enabled and a template is selected, drafting sends a continuation request through that template. After a completed sentence it asks for only the next sentence, without explanations, headings, or repeated input. For an unfinished sentence, it places the exact typed fragment at the beginning of the assistant's answer and lets the model generate only the missing suffix. That suffix is appended literally to the original document before retrieval, preserving whitespace and allowing partial-word completion without repairing words or inserting guessed spaces. The subsequent rewrite can still change the completed unfinished sentence, as described above. This helps instruction-following models continue prose rather than respond with advice.
+
+The unfinished fragment is supplied as an answer prefix only when the rendered template is outside an active reasoning region and the fragment contains no recognized reasoning/control markers. Otherwise drafting asks for the entire completed sentence beginning with the exact fragment, validates the final model output after extension hooks, and extracts only its suffix. Internal and trailing whitespace must match literally; leading separator whitespace stays preserved in the original document. A changed or missing prefix fails visibly before retrieval.
+
+If the checkbox is disabled or no template is selected, drafting uses the ordinary raw Notebook prompt. Templated drafts preserve the continuation instructions and the latest completed sentence or unfinished fragment; older prompt context can be trimmed with a visible notice, without changing the saved document. If the required request cannot fit, including after extensions change its tokenization, generation fails visibly. Extensions must preserve the exact supplied answer prefix and its native token cursor. Transformers tokenizer extensions that supply external `inputs_embeds` are unsupported for this prefix route because the cursor cannot be verified; disable that extension or use raw continuation. Raw continuation and manual Rewrite retain their existing extension behavior.
+
+**Maximum sentences per automatic generation** defaults to **5**, with a range of **1–100**, for each generation request. The request's original **Max new tokens** supplies a shared draft allowance across sentence-generation passes. It is tracked using the loaded tokenizer's text-token estimate, including reasoning and generated lookahead that is discarded after confirming a sentence boundary. A supplied answer prefix counts toward the prompt context budget; only its generated suffix consumes the draft allowance. In the full-sentence fallback, the generated copied prefix also consumes that allowance. Each rewrite pass has its own finite cap using the current **Max new tokens** setting. These limits are not an exact aggregate limit on backend work or final document length: rewriting adds generation passes and may lengthen or shorten sentences. Automatic mode is consequently slower than ordinary generation. A normal end-of-response in a templated one-sentence draft ends that step; the run can continue from the rewritten sentence until its limits. Natural end-of-output in a raw draft ends the run. Custom stopping strings end either route.
+
+During a run, accepted rewrites appear as a staged preview while the next sentence is being prepared. The final document is applied only after a fresh check that the Notebook input/output and selected prompt still match the run's starting state. Applying accepted text adds one guarded **Undo rewrite** operation for the whole run. In single-column Notebook, **Regenerate** first restores the input from the previous generation request. In two-column Notebook, **Generate** and **Shift+Enter** start from the input; **Continue** starts from the output, including when it is empty. That layout has no **Regenerate** button. Automatic mode writes its accepted document to output.
+
+The run checks that a model is loaded and the selected corpus/settings are current before drafting. Encoder-decoder (`seq2seq`) generation models are explicitly unsupported in automatic mode; manual Rewrite and ordinary generation retain their existing paths. Controls lock for the operation. **Stop generation**, a retrieval failure, no acceptable references, an incomplete rewrite, or a generation error discards the current provisional sentence. Already accepted rewrites remain available, and status explains why the run stopped. The system does not silently resume ordinary generation after such a failure. A stale Notebook edit prevents final application rather than overwriting that edit.
+
+Turning the checkbox off restores the normal Notebook generation callbacks. Chat, API generation, and manual Rewrite are unaffected by the checkbox. This extension changes no corpus cache format; restart the server after updating the code, but do not rebuild a corpus solely to enable automatic mode.
 
 ## Models and retrieval settings
 
@@ -130,9 +150,26 @@ A historical local comparison saved 72 rewrites: eight neutral queries against e
 
 ## Validation
 
+The automatic extension's final suite passed **510 tests and 17 subtests**, including the explicit CUDA scoring check. Controlled fixtures cover sentence sequencing, partial retention after an accepted rewrite, stale-edit guards, finite budgets, reasoning-template fallback, native prompt/cursor validation, extension transformations, cancellation, and checkbox-off routing. The validation-host log is `/workspace/rewrite-validation/automatic-release-tests.log`. Independent core, native-integration, and workflow source reviews approved after fixes.
+
+Current-code automatic browser workflows passed on Linux with two NVIDIA A40 GPUs:
+
+| Generation loader | Actual automatic-generation model |
+| --- | --- |
+| Transformers | Gemma 4 12B IT BF16. |
+| llama.cpp | Mistral-Nemo-Instruct-2407 Q4_K_M GGUF, GPU offload, 4,096-token context, binaries 0.138.0 CUDA 12.4. |
+
+Both runs used Python 3.12.3, PyTorch 2.8.0+cu128, Transformers 5.10.4, Sentence Transformers 6.1.0, and Gradio 4.37.2+custom.21. LateOn plus STS/NLI retrieval ran on `cuda:1`, with the selected instruction template for generation. The browser records include corpus hashes and generation settings: seed 42, temperature 0.3, a 150-token allowance, streaming enabled, and thinking disabled.
+
+Each final automatic workflow exercised Generate/Shift+Enter in both layouts, single-column Regenerate, two-column Continue from populated and empty output, a real two-sentence draft/retrieve/rewrite loop, whitespace-correct retrieval queries, both Stop buttons and retry, control locks, whole-run undo, ignored manual seed/review settings, and ordinary generation with the checkbox off. Default acceptance settings refused the first draft for insufficient reference length in both runs and preserved the original text. A minimum semantic score of 1 also verified refusal without editing. Retention after an already accepted sentence and stale edits were verified with controlled unit/UI fixtures, rather than claimed from those default-setting browser runs.
+
+To exercise all mechanical routes against the small synthetic corpus, both runs kept nuance reranking enabled but set the minimum length ratio and semantic score to 0 and maximum contradiction score to 1. Those relaxed runs verify the loop and application controls, not retrieval relevance, meaning preservation, or literary quality. In particular, empty-output Continue verifies its source routing; its generated prose is not a creative-quality benchmark. Final records are `/workspace/rewrite-validation/automatic-gemma-release-browser/browser-results.json` and `/workspace/rewrite-validation/automatic-nemo-release-browser/browser-results.json`. Older automatic artifacts from the earlier prefix-copy implementation are superseded.
+
+Manual Rewrite regression browser workflows also passed for Gemma/Transformers and Nemo/llama.cpp, covering both layouts, failure/build/retry, review conflicts, Stop/retry, seeds/repetition, exact token matching, incomplete/custom-stop errors, undo, and subsequent ordinary generation. Their records are `/workspace/rewrite-validation/automatic-gemma-manual-regression/browser-results.json` and `/workspace/rewrite-validation/automatic-nemo-manual-regression/browser-results.json`. Other automatic-mode loaders, models, platforms, extensions, and sampling configurations were not verified by these real-model runs.
+
 The earlier backend/installation validation passed **210 checks and 17 subtests**, including the explicit CUDA scoring check. That result predates ingestion quality screening and must not be read as validation of its new behavior. Current quality-change checks and real-model comparisons are recorded in [Rewrite-Quality.md](Rewrite-Quality.md). The `tests/test_rewrite_*.py` suites cover segmentation, token limits, cache invalidation and transactional failure, retrieval, reranking, prompt budgets, native generation adapters, and UI application guards. They use controlled fixtures for reproducible behavior; these checks do not establish semantic accuracy for arbitrary text or runtime support for every loader.
 
-Real browser workflows passed on Linux with NVIDIA A40 GPUs:
+Earlier manual Rewrite browser workflows passed on Linux with NVIDIA A40 GPUs. This broader loader list does not establish automatic-mode runtime coverage:
 
 | Generation loader | Actual model tested |
 | --- | --- |
@@ -166,3 +203,11 @@ python tests/manual/rewrite_browser.py --url http://127.0.0.1:7860 --device cuda
 ```
 
 The default corpus is `tests/fixtures/rewrite_reference_sentences.txt`; override it with `--corpus /absolute/path/to/references.txt`. The script and server must share the same filesystem because resolved paths are submitted as server-local paths. Use a scratch Notebook/session: the script changes text, sampling settings, and layout, explicitly starts with one column, and sets seed 42 and temperature 0.3. It exercises failure/retry, lock states, previews, application/undo, stale-proposal protection, stopping, seed/repeat behavior, exact token matching, incomplete output and custom-stop errors, ordinary generation, and two-column output. JSON results are saved even on exceptions; a successful run also saves a screenshot. These live checks depend on the loaded model and hardware, and are not part of the default unit suite.
+
+Run the separate automatic workflow against the same kind of scratch server with a real model loaded:
+
+```sh
+python tests/manual/rewrite_automatic_browser.py --url http://127.0.0.1:7860 --device cuda:1 --output-dir rewrite-automatic-artifacts
+```
+
+It uses the same default corpus and server-local path convention, changes text/settings/layout, and records both acceptance refusals and deliberately relaxed mechanical tests. It checks the six native generation routes, sentence iteration, source selection, Stop/retry, undo, locks, and checkbox-off ordinary generation. Do not interpret a mechanical pass with relaxed thresholds as a retrieval-quality result.

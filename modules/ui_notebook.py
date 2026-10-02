@@ -69,7 +69,7 @@ def create_ui():
                     shared.gradio['prompt_menu-notebook'] = gr.Dropdown(choices=utils.get_available_prompts(), value=shared.settings['prompt-notebook'], label='Prompt', elem_classes='slim-dropdown')
 
                 with gr.Row():
-                    ui.create_refresh_button(shared.gradio['prompt_menu-notebook'], lambda: None, lambda: {'choices': utils.get_available_prompts()}, ['refresh-button'], interactive=not mu)
+                    shared.gradio['refresh_prompt-notebook'] = ui.create_refresh_button(shared.gradio['prompt_menu-notebook'], lambda: None, lambda: {'choices': utils.get_available_prompts()}, ['refresh-button'], interactive=not mu)
                     shared.gradio['new_prompt-notebook'] = gr.Button('New', elem_classes=['refresh-button'], interactive=not mu)
                     shared.gradio['rename_prompt-notebook'] = gr.Button('Rename', elem_classes=['refresh-button'], interactive=not mu)
                     shared.gradio['delete_prompt-notebook'] = gr.Button('🗑️', elem_classes=['refresh-button', 'delete-icon-btn'], interactive=not mu)
@@ -84,11 +84,15 @@ def create_ui():
 
 def create_event_handlers():
     ui_sentence_rewrite.create_event_handlers('notebook')
+    rewrite_ui, _ = shared.gradio['rewrite-ui-notebook']
+    generation = rewrite_ui['generation_dispatch'](generate_and_save_wrapper_notebook)
+    generation_inputs = [shared.gradio['textbox-notebook'], *rewrite_ui['generation_inputs']]
     shared.gradio['Generate-notebook'].click(
         lambda x: x, gradio('textbox-notebook'), gradio('last_input-notebook')).then(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
         lambda: [gr.update(visible=True), gr.update(visible=False)], None, gradio('Stop-notebook', 'Generate-notebook')).then(
-        generate_and_save_wrapper_notebook, gradio('textbox-notebook', 'interface_state', 'prompt_menu-notebook'), gradio(outputs), show_progress=False).then(
+        generation, generation_inputs, rewrite_ui['generation_outputs'], show_progress=False).then(
+        rewrite_ui['generation_commit'], rewrite_ui['generation_commit_inputs'], rewrite_ui['generation_commit_outputs'], show_progress=False).then(
         lambda state, text: state.update({'textbox-notebook': text}), gradio('interface_state', 'textbox-notebook'), None).then(
         lambda: [gr.update(visible=False), gr.update(visible=True)], None, gradio('Stop-notebook', 'Generate-notebook')).then(
         None, None, None, js=f'() => {{{ui.audio_notification_js}}}')
@@ -97,7 +101,8 @@ def create_event_handlers():
         lambda x: x, gradio('textbox-notebook'), gradio('last_input-notebook')).then(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
         lambda: [gr.update(visible=True), gr.update(visible=False)], None, gradio('Stop-notebook', 'Generate-notebook')).then(
-        generate_and_save_wrapper_notebook, gradio('textbox-notebook', 'interface_state', 'prompt_menu-notebook'), gradio(outputs), show_progress=False).then(
+        generation, generation_inputs, rewrite_ui['generation_outputs'], show_progress=False).then(
+        rewrite_ui['generation_commit'], rewrite_ui['generation_commit_inputs'], rewrite_ui['generation_commit_outputs'], show_progress=False).then(
         lambda state, text: state.update({'textbox-notebook': text}), gradio('interface_state', 'textbox-notebook'), None).then(
         lambda: [gr.update(visible=False), gr.update(visible=True)], None, gradio('Stop-notebook', 'Generate-notebook')).then(
         None, None, None, js=f'() => {{{ui.audio_notification_js}}}')
@@ -106,7 +111,8 @@ def create_event_handlers():
         lambda x: x, gradio('last_input-notebook'), gradio('textbox-notebook'), show_progress=False).then(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
         lambda: [gr.update(visible=True), gr.update(visible=False)], None, gradio('Stop-notebook', 'Generate-notebook')).then(
-        generate_and_save_wrapper_notebook, gradio('textbox-notebook', 'interface_state', 'prompt_menu-notebook'), gradio(outputs), show_progress=False).then(
+        generation, generation_inputs, rewrite_ui['generation_outputs'], show_progress=False).then(
+        rewrite_ui['generation_commit'], rewrite_ui['generation_commit_inputs'], rewrite_ui['generation_commit_outputs'], show_progress=False).then(
         lambda state, text: state.update({'textbox-notebook': text}), gradio('interface_state', 'textbox-notebook'), None).then(
         lambda: [gr.update(visible=False), gr.update(visible=True)], None, gradio('Stop-notebook', 'Generate-notebook')).then(
         None, None, None, js=f'() => {{{ui.audio_notification_js}}}')
@@ -116,7 +122,7 @@ def create_event_handlers():
         lambda state, text: state.update({'textbox-notebook': text}), gradio('interface_state', 'textbox-notebook'), None)
 
     shared.gradio['markdown_render-notebook'].click(lambda x: x, gradio('textbox-notebook'), gradio('markdown-notebook'), queue=False)
-    shared.gradio['Stop-notebook'].click(stop_everything_event, None, None, queue=False)
+    shared.gradio['Stop-notebook'].click(stop_notebook_generation, rewrite_ui['session'], rewrite_ui['status'], queue=False, api_name=False)
     shared.gradio['prompt_menu-notebook'].change(load_prompt, gradio('prompt_menu-notebook'), gradio('textbox-notebook'), show_progress=False)
     shared.gradio['new_prompt-notebook'].click(handle_new_prompt, None, gradio('prompt_menu-notebook'), show_progress=False)
 
@@ -169,6 +175,11 @@ def create_event_handlers():
         logits.get_next_logits, gradio('textbox-notebook', 'interface_state', 'use_samplers-notebook', 'logits-notebook'), gradio('logits-notebook', 'logits-notebook-previous'), show_progress=False)
 
     shared.gradio['get_tokens-notebook'].click(get_token_ids, gradio('textbox-notebook'), gradio('tokens-notebook'), show_progress=False)
+
+
+def stop_notebook_generation(session):
+    stop_everything_event()
+    return ui_sentence_rewrite.stop_notebook_generation(session)
 
 
 def generate_and_save_wrapper_notebook(textbox_content, interface_state, prompt_name):

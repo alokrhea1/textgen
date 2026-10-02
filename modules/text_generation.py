@@ -58,6 +58,12 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
     rewrite_guard = state.get('_rewrite_generation_guard', False)
     rewrite_stop = state.get('_rewrite_stop_predicate') if rewrite_guard else None
     rewrite_event = state.get('stop_event') if rewrite_guard else None
+    rewrite_kind = state.get('_rewrite_prompt_kind') if rewrite_guard else None
+    automatic_prefill = state.get('_notebook_auto_prefill_suffix') if rewrite_guard else None
+    automatic = state.get('_notebook_auto_generation', False)
+    automatic_stop = state.get('_notebook_auto_stop_predicate') if automatic else None
+    automatic_event = state.get('stop_event') if automatic else None
+    automatic_info = state.get('_notebook_auto_generation_info') if automatic else None
     # Find the appropriate generation function
     generate_func = apply_extensions('custom_generate_reply')
     if generate_func is None:
@@ -80,10 +86,26 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
     if not is_chat:
         state = apply_extensions('state', state)
         question = apply_extensions('input', question, state)
+    if automatic:
+        # Drafts retain ordinary Notebook context truncation, while operation
+        # cancellation, sentence stopping, and errors must survive state hooks.
+        state = dict(state)
+        state['_notebook_auto_generation'] = True
+        state['_notebook_auto_stop_predicate'] = automatic_stop
+        state['_notebook_auto_generation_info'] = automatic_info
+        if automatic_event is not None:
+            state['stop_event'] = automatic_event
+        state['skip_special_tokens'] = False
+        state['auto_max_new_tokens'] = False
+        state['stream'] = True
     if rewrite_guard:
         state = dict(state)
         state['_rewrite_generation_guard'] = True
         state['_rewrite_stop_predicate'] = rewrite_stop
+        if rewrite_kind is not None:
+            state['_rewrite_prompt_kind'] = rewrite_kind
+        if automatic_prefill is not None:
+            state['_notebook_auto_prefill_suffix'] = automatic_prefill
         if rewrite_event is not None:
             state['stop_event'] = rewrite_event
         state['skip_special_tokens'] = False
@@ -120,9 +142,20 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
     try:
         for reply in generated:
             cur_time = time.monotonic()
+            if automatic_info is not None:
+                automatic_info['raw_reply'] = reply
             reply, stop_found = apply_stopping_strings(reply, all_stop_strings)
             if escape_html:
                 reply = html.escape(reply)
+            if automatic:
+                terminal = stop_found or shared.stop_everything or (
+                    automatic_event is not None and automatic_event.is_set())
+                if terminal and automatic_info is not None:
+                    automatic_info['terminal'] = True
+                if not terminal and automatic_stop is not None and automatic_stop(reply):
+                    if automatic_info is not None:
+                        automatic_info['boundary'] = True
+                    break
             if rewrite_stop is not None and rewrite_stop(reply):
                 break
 
@@ -161,6 +194,9 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False, escap
 
 def validate_rewrite_prompt(question, state, input_ids=None, inputs_embeds=None, original_budget=None):
     """Opt-in no-truncation guard after extension transformations."""
+    prefill = state.get('_notebook_auto_prefill_suffix')
+    if prefill and not question.endswith(prefill):
+        raise ValueError('Automatic continuation prefill was changed by an extension. The prompt must end with the exact unfinished sentence prefix; it will not be silently repaired.')
     budget = get_max_prompt_length(state)
     if original_budget is not None:
         budget = min(budget, original_budget)
@@ -174,12 +210,47 @@ def validate_rewrite_prompt(question, state, input_ids=None, inputs_embeds=None,
             lengths.append(int(inputs_embeds.shape[-2]))
         count = max(lengths)
     if budget <= 0 or count > budget:
+        if state.get('_rewrite_prompt_kind') == 'Automatic continuation':
+            raise ValueError(
+                f'Automatic continuation prompt requires {count} tokens after extension hooks; '
+                f'only {budget} prompt tokens are available. Draft instructions will not be '
+                'silently truncated. Reduce the generation allowance or increase the context limit.'
+            )
         raise ValueError(
             f'Sentence rewrite prompt requires {count} tokens after extension hooks; '
             f'only {budget} prompt tokens are available. References will not be '
             'silently truncated. Reduce K/window size or increase the context limit.'
         )
     return count
+
+
+def automatic_prefill_token_suffix(question, state, input_ids):
+    """Locate the native token tail added by prefill, including boundary merges."""
+    prefill = state.get('_notebook_auto_prefill_suffix')
+    if not prefill:
+        return None
+    if not question.endswith(prefill):
+        raise ValueError('Automatic continuation prefill must end with the exact unfinished sentence prefix.')
+    base = encode(question[:-len(prefill)], add_bos_token=state['add_bos_token'], truncation_length=None)
+    before, after = base[0].tolist(), input_ids[0].tolist()
+    common = 0
+    for old, new in zip(before, after):
+        if old != new:
+            break
+        common += 1
+    suffix = after[common:]
+    if not suffix:
+        raise ValueError('The native tokenizer did not produce a verifiable automatic continuation prefill.')
+    return suffix
+
+
+def validate_automatic_prefill_tokens(input_ids, inputs_embeds, suffix):
+    if suffix is None:
+        return
+    if inputs_embeds is not None:
+        raise ValueError('Automatic continuation cannot verify the prefill cursor when a tokenizer extension supplies input embeddings. Disable that extension or use raw continuation.')
+    if input_ids is None or input_ids[0].tolist()[-len(suffix):] != suffix:
+        raise ValueError('A tokenizer extension changed the automatic continuation prefill cursor. The exact native token suffix must be preserved.')
 
 
 def encode(prompt, add_special_tokens=True, add_bos_token=True, truncation_length=None):
@@ -481,20 +552,40 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
 
     # Encode the input
     rewrite_guard = state.get('_rewrite_generation_guard', False)
+    automatic = state.get('_notebook_auto_generation', False)
+    automatic_event = state.get('stop_event') if automatic else None
+    rewrite_event = state.get('stop_event') if rewrite_guard else None
+    rewrite_kind = state.get('_rewrite_prompt_kind') if rewrite_guard else None
+    automatic_prefill = state.get('_notebook_auto_prefill_suffix') if rewrite_guard else None
     rewrite_budget = get_max_prompt_length(state) if rewrite_guard else None
     input_ids = encode(question, add_bos_token=state['add_bos_token'],
                        truncation_length=None if rewrite_guard else get_max_prompt_length(state))
     output = input_ids[0]
     shared.model.last_prompt_token_count = input_ids.shape[-1]
     shared.model.last_completion_token_count = 0
+    prefill_tokens = automatic_prefill_token_suffix(question, state, input_ids) if rewrite_guard else None
     if state['auto_max_new_tokens']:
         generate_params['max_new_tokens'] = state['truncation_length'] - input_ids.shape[-1]
 
     # Add the encoded tokens to generate_params
     question, input_ids, inputs_embeds = apply_extensions('tokenizer', state, question, input_ids, None)
+    if automatic:
+        state['_notebook_auto_generation'] = True
+        state['stream'] = True
+        state['skip_special_tokens'] = False
+        state['auto_max_new_tokens'] = False
+        if automatic_event is not None:
+            state['stop_event'] = automatic_event
     if rewrite_guard:
         state['_rewrite_generation_guard'] = True
         state['skip_special_tokens'] = False
+        if rewrite_kind is not None:
+            state['_rewrite_prompt_kind'] = rewrite_kind
+        if automatic_prefill is not None:
+            state['_notebook_auto_prefill_suffix'] = automatic_prefill
+        if rewrite_event is not None:
+            state['stop_event'] = rewrite_event
+        validate_automatic_prefill_tokens(input_ids, inputs_embeds, prefill_tokens)
         shared.model.last_prompt_token_count = validate_rewrite_prompt(
             question, state, input_ids, inputs_embeds, original_budget=rewrite_budget,
         )
@@ -558,7 +649,8 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
                     shared.model.generate(**kwargs)
 
             def generate_with_streaming(**kwargs):
-                return Iteratorize(generate_with_callback, [], kwargs, callback=None)
+                return Iteratorize(generate_with_callback, [], kwargs, callback=None,
+                                   raise_exceptions=bool(rewrite_guard or automatic))
 
             with generate_with_streaming(**generate_params) as generator:
                 cumulative_reply = ''
@@ -580,14 +672,14 @@ def generate_reply_HF(question, original_question, state, stopping_strings=None,
 
     except Exception:
         logger.exception("Failed to generate reply (HF)")
-        if rewrite_guard:
+        if rewrite_guard or state.get('_notebook_auto_generation', False):
             raise
     finally:
         t1 = time.time()
         original_tokens = len(original_input_ids[0])
         new_tokens = len(output) - (original_tokens if not shared.is_seq2seq else 0)
         logger.info(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {seed})')
-        if not rewrite_guard:
+        if not rewrite_guard and not state.get('_notebook_auto_generation', False):
             return
 
 
@@ -622,12 +714,12 @@ def generate_reply_custom(question, original_question, state, stopping_strings=N
 
     except Exception:
         logger.exception("Failed to generate reply (custom)")
-        if state.get('_rewrite_generation_guard', False):
+        if state.get('_rewrite_generation_guard', False) or state.get('_notebook_auto_generation', False):
             raise
     finally:
         t1 = time.time()
 
-        if state.get('_rewrite_generation_guard', False):
+        if state.get('_rewrite_generation_guard', False) or state.get('_notebook_auto_generation', False):
             # Cleanup must not tokenize again: llama.cpp tokenization is an
             # HTTP request and could block Stop or mask the original failure.
             context = getattr(shared.model, 'last_prompt_token_count', None)
@@ -643,7 +735,7 @@ def generate_reply_custom(question, original_question, state, stopping_strings=N
             original_tokens = len(encode(original_question)[0])
             new_tokens = len(encode(original_question + reply)[0]) - original_tokens
 
-        if not state.get('_rewrite_generation_guard', False):
+        if not state.get('_rewrite_generation_guard', False) and not state.get('_notebook_auto_generation', False):
             logger.info(f'Output generated in {(t1-t0):.2f} seconds ({new_tokens/(t1-t0):.2f} tokens/s, {new_tokens} tokens, context {original_tokens}, seed {state["seed"]})')
             return
 

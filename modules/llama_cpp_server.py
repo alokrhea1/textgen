@@ -154,10 +154,10 @@ class LlamaServer:
         if n_probs and n_probs > 0:
             payload["n_probs"] = n_probs
 
-        if state.get('_rewrite_generation_guard'):
+        if state.get('_rewrite_generation_guard') or state.get('_notebook_auto_generation'):
             # /completion has no skip_special_tokens option. Both llama.cpp
             # servers accept preserved_tokens, keeping reasoning delimiters
-            # visible to Rewrite's sentence extraction without --special's
+            # visible to Notebook sentence extraction without --special's
             # server-wide change to ordinary generation.
             payload['preserved_tokens'] = [
                 '<think>', '</think>', '<seed:think>', '</seed:think>',
@@ -194,7 +194,7 @@ class LlamaServer:
     def _rewrite_stream_lines(self, payload, stop_event):
         """Read a dedicated connection while Stop can interrupt headers or tokens.
 
-        requests exposes its socket only after response headers arrive. Rewrite
+        requests exposes its socket only after response headers arrive. Notebook
         needs to stop during prompt evaluation too, so it owns this connection
         from connect through close. The worker never touches shared generation
         state or the reusable requests session.
@@ -228,7 +228,7 @@ class LlamaServer:
                 if response.status == 400:
                     error = json.loads(response.read()).get('error', {})
                     if error.get('type') == 'exceed_context_size_error':
-                        raise ValueError('Sentence rewrite prompt exceeds the available llama.cpp context.')
+                        raise ValueError('Generation prompt exceeds the available llama.cpp context.')
                     raise requests.HTTPError(f'llama.cpp completion failed: {error}')
                 if response.status >= 400:
                     raise requests.HTTPError(f'llama.cpp completion failed: HTTP {response.status}')
@@ -277,7 +277,8 @@ class LlamaServer:
 
     def generate_with_streaming(self, prompt, state):
         stop_event = state.get('stop_event')
-        if state.get('_rewrite_generation_guard') and (
+        operation_guard = state.get('_rewrite_generation_guard') or state.get('_notebook_auto_generation')
+        if operation_guard and (
             shared.stop_everything or (stop_event and stop_event.is_set())
         ):
             return
@@ -323,6 +324,13 @@ class LlamaServer:
             context = min(state['truncation_length'], self.n_ctx or state['truncation_length'])
             budget = context - state['max_new_tokens']
             if budget <= 0 or self.last_prompt_token_count > budget:
+                if state.get('_rewrite_prompt_kind') == 'Automatic continuation':
+                    raise ValueError(
+                        f'Automatic continuation prompt requires {self.last_prompt_token_count} tokens; '
+                        f'only {budget} prompt tokens are available in the llama.cpp context. '
+                        'Draft instructions will not be silently truncated. Reduce Max new tokens '
+                        'or increase the context limit.'
+                    )
                 raise ValueError(
                     f'Sentence rewrite prompt requires {self.last_prompt_token_count} tokens; '
                     f'only {budget} prompt tokens are available in the llama.cpp context. '
@@ -330,8 +338,9 @@ class LlamaServer:
                 )
             if state['auto_max_new_tokens']:
                 max_new_tokens = context - self.last_prompt_token_count
-            if stop_event and stop_event.is_set():
-                return
+
+        if operation_guard and (shared.stop_everything or (stop_event and stop_event.is_set())):
+            return
 
         payload.update({
             "n_predict": max_new_tokens,
@@ -350,9 +359,8 @@ class LlamaServer:
         self.last_completion_token_count = 0
 
         # Make the generation request
-        rewrite = state.get('_rewrite_generation_guard', False)
-        response = None if rewrite else self.session.post(url, json=payload, stream=True)
-        lines = self._rewrite_stream_lines(payload, stop_event) if rewrite else response.iter_lines()
+        response = None if operation_guard else self.session.post(url, json=payload, stream=True)
+        lines = self._rewrite_stream_lines(payload, stop_event) if operation_guard else response.iter_lines()
         try:
             if response is not None and response.status_code == 400 and response.json().get("error", {}).get("type") == "exceed_context_size_error":
                 logger.error("The request exceeds the available context size, try increasing it")
@@ -399,7 +407,7 @@ class LlamaServer:
                     print(f"Problematic line: {line}")
                     continue
         finally:
-            if rewrite:
+            if operation_guard:
                 lines.close()
             else:
                 response.close()

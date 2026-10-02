@@ -18,7 +18,7 @@ class Iteratorize:
     Adapted from: https://stackoverflow.com/a/9969000
     """
 
-    def __init__(self, func, args=None, kwargs=None, callback=None):
+    def __init__(self, func, args=None, kwargs=None, callback=None, raise_exceptions=False):
         self.mfunc = func
         self.c_callback = callback
         self.q = Queue()
@@ -26,6 +26,9 @@ class Iteratorize:
         self.args = args or []
         self.kwargs = kwargs or {}
         self.stop_now = False
+        self.raise_exceptions = raise_exceptions
+        self.worker_exception = None
+        self.worker_exception_raised = False
 
         def _callback(val):
             if self.stop_now or shared.stop_everything:
@@ -33,11 +36,13 @@ class Iteratorize:
             self.q.put(val)
 
         def gentask():
+            ret = None
             try:
                 ret = self.mfunc(callback=_callback, *self.args, **self.kwargs)
             except StopNowException:
                 pass
-            except Exception:
+            except Exception as error:
+                self.worker_exception = error
                 logger.exception("Failed in generation callback")
 
             self.q.put(self.sentinel)
@@ -53,6 +58,9 @@ class Iteratorize:
     def __next__(self):
         obj = self.q.get(True, None)
         if obj is self.sentinel:
+            if self.raise_exceptions and self.worker_exception is not None:
+                self.worker_exception_raised = True
+                raise self.worker_exception
             raise StopIteration
         else:
             return obj
@@ -70,3 +78,10 @@ class Iteratorize:
         # wait for that worker to leave generation before returning to the caller.
         if self.thread is not current_thread():
             self.thread.join()
+        # A sentence boundary can close the consumer before it reads the
+        # sentinel. A real worker failure must still reach guarded generation;
+        # intentional callback cancellation has no recorded exception.
+        if (self.raise_exceptions and self.worker_exception is not None
+                and not self.worker_exception_raised and exc_type in (None, GeneratorExit)):
+            self.worker_exception_raised = True
+            raise self.worker_exception

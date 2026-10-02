@@ -88,8 +88,8 @@ main conflict risk:
 
 | Area | Paths to inspect together | Required behavior / checks |
 | --- | --- | --- |
-| Notebook UI | `modules/ui_notebook.py`, `ui_default.py`, `ui_sentence_rewrite.py`, `callbacks.py` | Both layouts; native state gathering; build locks/errors/retry; seed/repeat; review/apply/undo; stale-edit protection; escaped HTML and autosave behavior. `test_rewrite_ui.py` plus browser smoke. |
-| Generation boundary | `modules/text_generation.py`, `sentence_rewrite/engine.py` | Match actual backend BOS/special-token/extension tokenization. Preserve all references or fail; retain context-trim notices. Keep native sampling/hooks, per-request stopping, iterator cleanup, and visible Rewrite errors without changing ordinary generation. Engine/native tests plus real rewrites and ordinary Generate afterward. |
+| Notebook UI | `modules/ui_notebook.py`, `ui_default.py`, `ui_sentence_rewrite.py`, `callbacks.py` | Both layouts; native state gathering; build locks/errors/retry; seed/repeat; review/apply/undo; stale-edit protection; escaped HTML and autosave behavior. Keep the session-only automatic checkbox off by default and retain exact ordinary-generation callbacks when off. Check Generate/Shift+Enter in both layouts, single-column Regenerate restoring last input, and two-column Continue starting from output even when empty. Preserve plain Enter as a newline. `test_rewrite_ui.py` plus browser smoke. |
+| Generation boundary | `modules/text_generation.py`, `sentence_rewrite/{engine,automatic}.py` | Match actual backend BOS/special-token/extension tokenization. Preserve all references or fail; retain context-trim notices. Keep native sampling/hooks, per-request stopping, iterator cleanup, and visible Rewrite errors. Automatic generation must draft/retrieve/rewrite before continuing from the accepted document, respect finite draft and rewrite limits, discard provisional sentences on Stop/error, and retain accepted rewrites through a fresh guarded commit. Protect templated continuation instructions/current sentence through extension tokenization; distinguish templated per-step EOS from raw terminal EOS and custom stops. Automatic/engine/native tests plus real rewrites and checkbox-off ordinary Generate afterward. |
 | Native backends | `modules/exllamav3.py`, `llama_cpp_server.py`, `tensorrt_llm.py` | Recheck against actual context after loading; no silent prompt slicing. Cancel blocked requests and release jobs/sockets. Preserve reasoning markers for sentence extraction. Backend adapter tests plus real models for each changed backend. `--ik` is a distinct binary to check. |
 | Transformers/Gemma | `modules/transformers_loader.py`, `text_generation.py`, `requirements/rewrite-gemma4.txt` | Gemma Unified loading/EOS handling stays scoped to `gemma4_unified`. Recheck native template/thinking output, HF generation APIs, and model loading when changing Transformers. |
 | Retrieval and cache | `modules/sentence_rewrite/{cleanup,quality,sentences,embeddings,corpus,reranker}.py` | Trained token projection/roles, exact MaxSim, native-token eligibility, STS/NLI scores, source offsets, transactional cache and cancellation. Corresponding unit suites and real retrieval smoke. |
@@ -168,6 +168,41 @@ incomplete/custom-stop errors, and ordinary generation after Rewrite. Exercise
 each changed loader and dependency profile; do not infer new binary/Transformers
 compatibility from the old version's browser results. A UI/template/streaming
 change merits a browser run even when the unit suite passes.
+
+For automatic per-sentence generation, inspect and run the corresponding
+`test_rewrite_automatic.py` and automatic UI checks as well. Run
+`tests/manual/rewrite_automatic_browser.py` against the same kind of scratch
+server, following the feature guide. A live browser check
+must show Generate/Shift+Enter in both layouts, single-column Regenerate restoring the
+last input, and two-column Continue using output even when empty,
+continuation from each rewritten sentence, completion/replacement of an initial
+unfinished sentence, finite draft/sentence limits, Stop/error/no-reference
+retention of prior accepted rewrites, controls unlocking, stale-edit protection,
+one guarded undo for the run, and ordinary generation with the checkbox off.
+Manual seed/review controls must remain manual-only. Do not infer automatic-mode
+runtime coverage for other loaders from historical manual Rewrite checks. The
+extension alone changes no cache identity; future changes to ingestion or
+embedding still require the deliberate cache review described above.
+
+Check selected-template drafting with a real instruction-following model as well
+as raw continuation. After completed input, templated drafts must request only
+the next sentence. For unfinished input, supply its exact prefix at the assistant
+answer cursor when no active reasoning region or typed reasoning/control markers
+prevent that placement, then append the literal generated suffix to the original
+source. Preserve internal/trailing whitespace, leading source separators, and
+partial-word completion. Active reasoning/control cases retain the strict entire
+completed-sentence copy contract: validate after native output hooks, refuse a
+changed/missing prefix before retrieval, and extract only its suffix. Supplied
+prefixes count toward the native prompt budget; copied prefixes consume the
+generated allowance only in that fallback. Input/state/tokenizer extensions must
+preserve the answer cursor or fail. Transformers tokenizer extensions supplying
+external `inputs_embeds` are explicitly unsupported for supplied-prefix drafting;
+raw/manual generation retains its existing extension path. Preserve the
+instructions and latest completed/unfinished sentence when trimming older prompt
+context, and report required-prompt overflow after extensions rather than
+silently dropping that content. A templated one-sentence response ending normally
+must permit another draft within the run's limits; raw natural EOS and custom
+stopping strings must still end their applicable routes.
 
 Check normal Notebook behavior, Chat/API smoke and applicable upstream tests when
 the merge changes those routes. Check template selection, tokenization, loaded

@@ -1,4 +1,4 @@
-"""Manual, session-scoped retrieval rewriting for both Notebook layouts."""
+"""Session-scoped retrieval rewriting for both Notebook layouts."""
 from dataclasses import asdict
 import hashlib
 import html
@@ -58,6 +58,15 @@ class RewriteSession:
 def _guard():
     if shared.args.multi_user:
         raise ValueError('Local server-file retrieval is disabled in multi-user mode.')
+
+
+def stop_notebook_generation(session):
+    """Cancel this session's whole automatic operation, including retrieval."""
+    if session.busy and session.phase == 'automatic':
+        session.cancel.set()
+    # The stream owns status updates. An asynchronous Stop response can arrive
+    # after its final status, so this callback must not overwrite that result.
+    return gr.update()
 
 
 def _settings_path(mode):
@@ -221,10 +230,16 @@ def create_ui(mode='notebook'):
 
     with gr.Tab('Rewrite'):
         gr.Markdown('Build a local text corpus, then rewrite the last complete sentence using matching examples. '
-                    'Generation runs only when you click **Rewrite**. Edit the notebook or supply a seed sentence to steer it.')
+                    'Enable automatic rewriting to retrieve and rewrite each newly completed sentence before generation continues. '
+                    'Editing text never starts generation.')
         if shared.args.multi_user:
             gr.Markdown('Local file retrieval is disabled in multi-user mode.')
         c['session'] = gr.State(RewriteSession(), delete_callback=lambda state: state.dispose())
+        control('auto', gr.Checkbox(label='Automatically retrieve and rewrite generated sentences', value=False,
+                                   info='Applies to Notebook Generate, Continue, and Regenerate. Requires a ready corpus and a loaded generation model. Drafting shares the current Max new tokens allowance across the run; each rewrite has its own allowance. This setting is session-only.'))
+        control('auto_max_sentences', gr.Slider(1, 100, step=1, value=5,
+                                               label='Maximum sentences per automatic generation',
+                                               info='Each newly completed sentence is rewritten before the next sentence is generated. Stop keeps completed rewrites and discards unfinished drafts.'))
         control('paths', gr.Textbox(label='Local .txt files or directories — one path per line', lines=3,
                                    value=defaults['paths'], info='Paths are on the server. Relative paths start in the application directory.'))
         with gr.Row():
@@ -283,13 +298,14 @@ def create_ui(mode='notebook'):
                                                    label='Maximum contradiction score',
                                                    info='Requires meaning and nuance reranking. English NLI scores are heuristic. Reject references that strongly contradict the target; increase for indirect style matches or multilingual text. 1 disables this filter.'))
         control('seed', gr.Textbox(label='Optional seed sentence', lines=2,
-                                  info='Leave blank to use the notebook’s last period-completed sentence. A seed guides its replacement.'))
+                                  info='Manual Rewrite only. Leave blank to use the notebook’s last period-completed sentence. A seed guides its replacement.'))
         control('guidance', gr.Textbox(label='Optional writing guidance', lines=2,
                                       placeholder='For example: vary the syntax and use concrete, vivid verbs.'))
         with gr.Row():
             control('template', gr.Checkbox(label='Use the selected instruction template', value=True))
             control('thinking', gr.Checkbox(label='Enable model thinking for this rewrite', value=False))
-            control('review', gr.Checkbox(label='Review before applying', value=False))
+            control('review', gr.Checkbox(label='Review before applying', value=False,
+                                         info='Manual Rewrite only. Automatic generation applies accepted sentences together after the run.'))
         with gr.Row():
             control('search', gr.Button('Preview references'))
             control('rewrite', gr.Button('Rewrite', variant='primary'))
@@ -302,6 +318,8 @@ def create_ui(mode='notebook'):
         c['target'] = gr.Textbox(label='Sentence used for retrieval', interactive=False, lines=2)
         c['result'] = gr.Textbox(label='Proposed replacement', interactive=False, lines=3)
         c['references'] = gr.Textbox(label='Retrieved references and sources', interactive=False, lines=10)
+        c['auto_preview'] = gr.Textbox(label='Automatic generation preview', interactive=False, lines=10,
+                                       info='Staged document containing completed rewrites. Notebook text updates once the run finishes or stops; unfinished drafts are discarded.')
     if shared.args.multi_user:
         for component in controls:
             component.interactive = False
@@ -325,10 +343,63 @@ def create_event_handlers(mode='notebook'):
         enabled = not locked and not shared.args.multi_user
         value = {session: s, c['status']: message}
         value.update({component: gr.update(interactive=enabled) for component in controls})
-        value[c['stop']] = gr.update(interactive=locked and s.phase == 'rewrite')
-        value[c['apply']] = gr.update(interactive=enabled and s.pending is not None)
+        value[c['stop']] = gr.update(interactive=locked and s.phase in ('rewrite', 'automatic'))
+        value[c['apply']] = gr.update(interactive=enabled and s.pending is not None and s.pending.get('kind') != 'automatic')
         value[c['undo']] = gr.update(interactive=enabled and bool(s.history))
         return value
+
+    def retrieval(s, settings, top_k, length_mode, sentence_count, token_tolerance,
+                  scoring, diversity, exclude_exact, nuance, rerank_pool,
+                  min_length_ratio, min_semantic_score, max_contradiction_score, progress):
+        """Validate once and share the exact retrieval setup across both strategies."""
+        _guard()
+        if s.index is None or s.encoder is None:
+            raise ValueError('Build the corpus first.')
+        corpus_config, embedding_config = _configs(settings)
+        if corpus_config != s.config or embedding_config != s.embedding_config:
+            raise ValueError('Corpus settings changed. Build the corpus before retrieving.')
+        token_counter = None
+        token_counter_key = None
+        if length_mode == 'tokens':
+            from modules.text_generation import get_encoded_length
+            from modules.models import load_model_if_idle_unloaded
+            load_model_if_idle_unloaded()
+            tokenizer = shared.tokenizer
+            model_name = shared.model_name
+
+            def token_counter(value):
+                if shared.tokenizer is not tokenizer or shared.model_name != model_name:
+                    raise ValueError('Generation tokenizer changed during retrieval. Retry with the current model.')
+                return get_encoded_length(value)
+            if not shared.args.extensions:
+                token_counter_key = (model_name, id(tokenizer))
+        reranker = None
+        if nuance:
+            reranker_config = (embedding_config.device, embedding_config.local_files_only)
+            if s.reranker is None or s.reranker_config != reranker_config:
+                if s.reranker is not None:
+                    s.reranker.release()
+                s.reranker = NuanceReranker(device=embedding_config.device, local_files_only=embedding_config.local_files_only)
+                s.reranker_config = reranker_config
+            reranker = s.reranker
+            reranker.load(lambda msg: progress(None, desc=msg))
+
+        def retrieve(query):
+            if s.cancel.is_set():
+                raise InterruptedError('Stopped before retrieval.')
+            hits = s.index.search(query, s.encoder, top_k=int(top_k), length_mode=length_mode,
+                                  sentence_count=int(sentence_count), token_tolerance=float(token_tolerance),
+                                  token_counter=token_counter, scoring=scoring, diversity=float(diversity),
+                                  exclude_exact=exclude_exact, progress=lambda msg: progress(None, desc=msg),
+                                  reranker=reranker, rerank_pool=int(rerank_pool), cancel_event=s.cancel,
+                                  token_counter_key=token_counter_key, min_length_ratio=float(min_length_ratio),
+                                  min_semantic_score=float(min_semantic_score) if nuance else 0.0,
+                                  max_contradiction_score=float(max_contradiction_score) if nuance else 1.0)
+            if s.cancel.is_set():
+                raise InterruptedError('Stopped before generation.')
+            return hits
+
+        return retrieve
 
     def build(s, paths, recursive, model, revision, device, max_tokens, batch_size,
               offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy, force, progress=gr.Progress()):
@@ -417,48 +488,12 @@ def create_event_handlers(mode='notebook'):
             initial = updates(s, 'Retrieving references…', locked=True)
             initial.update({c['result']: '', c['references']: '', c['target']: ''})
             yield initial
-            _guard()
-            if s.index is None or s.encoder is None:
-                raise ValueError('Build the corpus first.')
-            corpus_config, embedding_config = _configs(settings)
-            if corpus_config != s.config or embedding_config != s.embedding_config:
-                raise ValueError('Corpus settings changed. Build the corpus before retrieving.')
+            retrieve = retrieval(s, settings, top_k, length_mode, sentence_count, token_tolerance,
+                                 scoring, diversity, exclude_exact, nuance, rerank_pool,
+                                 min_length_ratio, min_semantic_score, max_contradiction_score, progress)
             original = _source(mode, text, left)
             working, span = _seeded(original, seed)
-            token_counter = None
-            token_counter_key = None
-            if length_mode == 'tokens':
-                from modules.text_generation import get_encoded_length
-                from modules.models import load_model_if_idle_unloaded
-                load_model_if_idle_unloaded()
-                tokenizer = shared.tokenizer
-                model_name = shared.model_name
-                def token_counter(value):
-                    if shared.tokenizer is not tokenizer or shared.model_name != model_name:
-                        raise ValueError('Generation tokenizer changed during retrieval. Retry with the current model.')
-                    return get_encoded_length(value)
-                if not shared.args.extensions:
-                    token_counter_key = (model_name, id(tokenizer))
-            reranker = None
-            if nuance:
-                reranker_config = (embedding_config.device, embedding_config.local_files_only)
-                if s.reranker is None or s.reranker_config != reranker_config:
-                    if s.reranker is not None:
-                        s.reranker.release()
-                    s.reranker = NuanceReranker(device=embedding_config.device, local_files_only=embedding_config.local_files_only)
-                    s.reranker_config = reranker_config
-                reranker = s.reranker
-                reranker.load(lambda msg: progress(None, desc=msg))
-            hits = s.index.search(span.text, s.encoder, top_k=int(top_k), length_mode=length_mode,
-                                  sentence_count=int(sentence_count), token_tolerance=float(token_tolerance),
-                                  token_counter=token_counter, scoring=scoring, diversity=float(diversity),
-                                  exclude_exact=exclude_exact, progress=lambda msg: progress(None, desc=msg),
-                                  reranker=reranker, rerank_pool=int(rerank_pool), cancel_event=s.cancel,
-                                  token_counter_key=token_counter_key, min_length_ratio=float(min_length_ratio),
-                                  min_semantic_score=float(min_semantic_score) if nuance else 0.0,
-                                  max_contradiction_score=float(max_contradiction_score) if nuance else 1.0)
-            if s.cancel.is_set():
-                raise InterruptedError('Stopped before generation.')
+            hits = retrieve(span.text)
             evidence = _evidence(hits, length_mode)
             retrieved = f'Retrieved {len(hits)} of requested {int(top_k)} references.'
             yield {c['target']: span.text, c['references']: evidence, c['result']: '', c['status']: retrieved}
@@ -520,6 +555,138 @@ def create_event_handlers(mode='notebook'):
                        paths, recursive, model, revision, device, max_tokens, batch_size,
                        offline, max_sentences, cleanup, join_hyphenated_lines, quality_policy, progress=progress, generate=True)
 
+    native_names = [f'prompt_menu-{mode}', f'Generate-{mode}', f'Stop-{mode}',
+                    f'get_logits-{mode}', f'refresh_prompt-{mode}',
+                    *[f'{action}_prompt-{mode}' for action in ('new', 'rename', 'delete')],
+                    *[f'{action}_prompt-{suffix}-{mode}' for action in ('rename', 'delete')
+                      for suffix in ('cancel', 'confirm')], f'rename_prompt_to-{mode}']
+    native_names += ['Regenerate-notebook', 'Undo'] if mode == 'notebook' else ['Continue-default']
+    native_controls = list(dict.fromkeys([notebook, input_text, prompt,
+                                         *[shared.gradio[name] for name in native_names if name in shared.gradio]]))
+    native_interactive = {component: component.interactive is not False for component in native_controls}
+    native_stop = shared.gradio.get(f'Stop-{mode}')
+
+    def automatic_updates(s, message, locked=False):
+        result = updates(s, message, locked=locked)
+        result.update({component: gr.update(interactive=False if locked else native_interactive[component])
+                       for component in native_controls})
+        if native_stop is not None:
+            result[native_stop] = gr.update(interactive=True if locked else native_interactive[native_stop])
+        return result
+
+    def generation_dispatch(native_wrapper):
+        """Return the opt-in route; disabled generation calls the native wrapper unchanged."""
+        def dispatch(source, s, enabled, text, left, prompt_name, state, guidance, use_template, thinking,
+                     automatic_max_sentences, top_k, length_mode, sentence_count, token_tolerance,
+                     scoring, diversity, exclude_exact, nuance, rerank_pool,
+                     min_length_ratio, min_semantic_score, max_contradiction_score,
+                     *settings, progress=gr.Progress()):
+            if not enabled:
+                native = native_wrapper(source, state, prompt_name) if mode == 'notebook' else native_wrapper(source, state)
+                try:
+                    for document, rendered in native:
+                        yield {notebook: document, html_output: rendered}
+                finally:
+                    native.close()
+                return
+            if not s.lock.acquire(blocking=False):
+                yield {c['status']: 'Another corpus operation is already running.'}
+                return
+            s.busy, s.phase, s.pending = True, 'automatic', None
+            s.cancel.clear()
+            accepted, completed, context_trimmed = source, 0, False
+            operation = None
+            abandoned = False
+            message = 'Automatic generation finished without a completed rewrite.'
+            try:
+                allowance = state.get('max_new_tokens', 'unset')
+                initial = automatic_updates(s, 'Preparing automatic sentence generation… '
+                                              f'Completed rewrites: 0 of {int(automatic_max_sentences)} maximum. '
+                                              f'Draft allowance: {allowance} tokens shared across the run; '
+                                              f'each rewrite has a separate allowance of up to {allowance} tokens.', locked=True)
+                initial.update({c['auto_preview']: source, c['target']: '', c['result']: '', c['references']: ''})
+                yield initial
+                _guard()
+                if s.index is None or s.encoder is None:
+                    raise ValueError('Build the corpus first.')
+                corpus_config, embedding_config = _configs(settings)
+                if corpus_config != s.config or embedding_config != s.embedding_config:
+                    raise ValueError('Corpus settings changed. Build the corpus before retrieving.')
+                s.index.assert_current(s.config, s.encoder, lambda msg: progress(None, desc=msg), s.cancel)
+                if s.cancel.is_set():
+                    raise InterruptedError('Stopped while checking the corpus.')
+                from modules import models
+                from modules.utils import check_model_loaded
+                models.load_model_if_idle_unloaded()
+                loaded, error = check_model_loaded()
+                if not loaded:
+                    raise ValueError(error or 'No model is loaded.')
+                tokenizer, model_name = shared.tokenizer, shared.model_name
+                retrieve_base = retrieval(s, settings, top_k, length_mode, sentence_count, token_tolerance,
+                                          scoring, diversity, exclude_exact, nuance, rerank_pool,
+                                          min_length_ratio, min_semantic_score, max_contradiction_score, progress)
+
+                def retrieve(query):
+                    if shared.tokenizer is not tokenizer or shared.model_name != model_name:
+                        raise ValueError('Generation model changed during automatic generation. Retry with the current model.')
+                    return retrieve_base(query)
+
+                from modules.sentence_rewrite.automatic import generate_automatic
+                generation_state = dict(state)
+                generation_state['enable_thinking'] = bool(thinking)
+                operation = generate_automatic(source, generation_state, retrieve, guidance=guidance,
+                                               use_template=use_template, cancel_event=s.cancel,
+                                               max_sentences=int(automatic_max_sentences))
+                for event in operation:
+                    accepted, completed = event.document, event.completed
+                    context_trimmed = context_trimmed or bool(getattr(event, 'context_trimmed', False))
+                    message = f'{event.status} | Completed rewrites: {completed} of {int(automatic_max_sentences)} maximum.'
+                    update = {c['auto_preview']: accepted, c['status']: message}
+                    if event.target:
+                        update[c['target']] = event.target
+                    if event.phase == 'retrieving':
+                        update[c['references']] = ''
+                        update[c['result']] = ''
+                    if event.hits is not None:
+                        update[c['references']] = _evidence(event.hits, length_mode)
+                    if event.phase == 'rewriting' or event.replacement:
+                        update[c['result']] = event.replacement
+                    yield update
+            except GeneratorExit:
+                abandoned = True
+                s.cancel.set()
+                raise
+            except Exception as exc:
+                if isinstance(exc, InterruptedError) or s.cancel.is_set():
+                    message = 'Stopped automatic generation.'
+                else:
+                    logger.exception('Automatic Notebook generation failed')
+                    message = f'AUTOMATIC GENERATION FAILED: {exc}'
+            finally:
+                try:
+                    if operation is not None:
+                        operation.close()
+                except Exception as exc:
+                    logger.exception('Automatic Notebook generation cleanup failed')
+                    message += f' Generation cleanup failed: {exc}'
+                finally:
+                    if completed > 0 and not s.closed and not abandoned:
+                        s.pending = dict(kind='automatic', before=text, after=accepted, text=text, left=left,
+                                         prompt=prompt_name, review=False, replacement='', seed=None,
+                                         context_trimmed=context_trimmed, automatic_status=message,
+                                         completed=completed)
+                    s.busy, s.phase = False, ''
+                    s.lock.release()
+                    if s.closed:
+                        s.dispose()
+            if completed > 0:
+                message += f' {completed} completed rewrite(s) ready to apply; unfinished drafts were discarded.'
+            else:
+                message += ' Notebook text is unchanged; correct the problem or click Generate to retry.'
+            yield automatic_updates(s, message)
+
+        return dispatch
+
     commit_outputs = [session, notebook, html_output, interface, c['status'], c['apply'], c['undo'], c['seed']]
     if mode == 'notebook':
         commit_outputs.append(shared.gradio['last_input-notebook'])
@@ -533,7 +700,9 @@ def create_event_handlers(mode='notebook'):
             if text != pending['text'] or left != pending['left'] or prompt_name != pending['prompt']:
                 s.pending = None
                 return {session: s, c['apply']: gr.update(interactive=False),
-                        c['status']: 'Notebook text or prompt changed. The proposed rewrite was not applied. Click Rewrite again.'}
+                        c['status']: ('Notebook text or prompt changed. Automatic generation was not applied. Click Generate again.'
+                                      if pending.get('kind') == 'automatic' else
+                                      'Notebook text or prompt changed. The proposed rewrite was not applied. Click Rewrite again.')}
             before, after = pending['before'], pending['after']
             s.history.append(dict(before=pending['text'], after=after, prompt=prompt_name, left=left))
             s.history[:] = s.history[-20:]
@@ -544,9 +713,12 @@ def create_event_handlers(mode='notebook'):
             result = {session: s, notebook: after, html_output: generate_basic_html(html.escape(after)), interface: state,
                       c['status']: 'Rewrite applied. Edit the text or click Rewrite again to continue.',
                       c['apply']: gr.update(interactive=False), c['undo']: gr.update(interactive=True)}
+            if pending.get('kind') == 'automatic':
+                result[c['status']] = (f'{pending["automatic_status"]} '
+                                       f'Applied {pending["completed"]} completed rewrite(s); unfinished drafts were discarded.')
             if pending.get('context_trimmed'):
                 result[c['status']] += ' Older notebook context was trimmed to fit the model; every reference was retained.'
-            if seed == pending['seed']:
+            if pending.get('kind') != 'automatic' and seed == pending['seed']:
                 result[c['seed']] = ''
             if mode == 'notebook':
                 result[shared.gradio['last_input-notebook']] = before
@@ -556,6 +728,13 @@ def create_event_handlers(mode='notebook'):
 
     def automatic_commit(*args):
         return commit(*args, automatic=True)
+
+    def generation_commit(s, *args):
+        # Ordinary generation may coexist with a reviewed manual proposal.
+        # Its completion must neither apply that proposal nor run file guards.
+        if s.pending is None or s.pending.get('kind') != 'automatic':
+            return {session: s}
+        return commit(s, *args, automatic=True)
 
     def undo(s, text, left, prompt_name, state):
         _guard()
@@ -576,6 +755,8 @@ def create_event_handlers(mode='notebook'):
 
     def stop(s):
         _guard()
+        if s.busy and s.phase == 'automatic':
+            return stop_notebook_generation(s)
         if s.busy and s.phase == 'rewrite':
             s.cancel.set()
             return 'Stopping generation. The notebook will keep its previous text.'
@@ -612,6 +793,19 @@ def create_event_handlers(mode='notebook'):
                   c['top_k'], c['length_mode'], c['sentence_count'], c['token_tolerance'], c['scoring'], c['diversity'], c['exclude_exact'],
                   c['nuance'], c['rerank_pool'], c['min_length_ratio'], c['min_semantic_score'],
                   c['max_contradiction_score'], *config_inputs]
+    c['generation_inputs'] = [session, c['auto'], notebook, input_text, prompt, interface,
+                              c['guidance'], c['template'], c['thinking'], c['auto_max_sentences'],
+                              c['top_k'], c['length_mode'], c['sentence_count'], c['token_tolerance'],
+                              c['scoring'], c['diversity'], c['exclude_exact'], c['nuance'], c['rerank_pool'],
+                              c['min_length_ratio'], c['min_semantic_score'], c['max_contradiction_score'],
+                              *config_inputs]
+    c['generation_outputs'] = list(dict.fromkeys([notebook, html_output, session, c['status'], c['target'],
+                                                 c['result'], c['references'], c['auto_preview'], *controls,
+                                                 *native_controls]))
+    c['generation_dispatch'] = generation_dispatch
+    c['generation_commit'] = generation_commit
+    c['generation_commit_inputs'] = undo_inputs
+    c['generation_commit_outputs'] = commit_outputs
     c['build'].click(build, [session, *config_inputs, c['force']], outputs, **queue_options)
     c['clear'].click(clear, session, outputs, **queue_options)
     c['search'].click(search, run_inputs, outputs, **queue_options)

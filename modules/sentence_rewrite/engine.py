@@ -21,13 +21,22 @@ class RewriteProgress:
     plan: PromptPlan | None = None
 
 
-def _replacement_body(reply, reasoning_prefix=''):
-    """Retain reasoning markers for extraction, then remove known final framing."""
+def _replacement_body(reply, reasoning_prefix='', preserve_leading=False):
+    """Remove reasoning and framing, optionally retaining continuation spacing."""
     from modules import shared
     from modules.reasoning import extract_reasoning
 
-    _, body = extract_reasoning(reasoning_prefix + reply)
-    body = body.lstrip()
+    framed = reasoning_prefix + reply
+    _, body = extract_reasoning(framed)
+    if preserve_leading and body and framed.endswith(body):
+        # Reasoning extraction strips the final region's leading whitespace.
+        # Recover just that adjacent whitespace for raw Notebook continuation.
+        before = framed[:-len(body)]
+        leading_count = len(before) - len(before.rstrip())
+        if leading_count:
+            body = before[-leading_count:] + body
+    if not preserve_leading:
+        body = body.lstrip()
     prefixes = ('<|start|>assistant', '<|im_start|>assistant', '<start_of_turn>model',
                 '<s>', getattr(shared, 'bos_token', ''))
     suffixes = ('<|im_end|>', '<|eot_id|>', '</s>', '<|endoftext|>', '<|end|>',
@@ -37,8 +46,11 @@ def _replacement_body(reply, reasoning_prefix=''):
     while changed:
         changed = False
         for marker in prefixes:
-            if marker and body.startswith(marker):
-                body = body[len(marker):].lstrip()
+            candidate = body.lstrip() if preserve_leading else body
+            if marker and candidate.startswith(marker):
+                body = candidate[len(marker):]
+                if not preserve_leading:
+                    body = body.lstrip()
                 changed = True
         for marker in suffixes:
             if marker and body.rstrip().endswith(marker):

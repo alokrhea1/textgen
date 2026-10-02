@@ -9,7 +9,7 @@ from modules.text_generation import (
     get_token_ids,
     stop_everything_event
 )
-from modules.ui_notebook import store_notebook_state_and_debounce
+from modules.ui_notebook import stop_notebook_generation, store_notebook_state_and_debounce
 from modules.utils import gradio, sanitize_filename
 
 inputs = ('textbox-default', 'interface_state')
@@ -32,7 +32,7 @@ def create_ui():
 
                 with gr.Row():
                     shared.gradio['prompt_menu-default'] = gr.Dropdown(choices=utils.get_available_prompts(), value=shared.settings['prompt-notebook'], label='Prompt', elem_classes='slim-dropdown')
-                    ui.create_refresh_button(shared.gradio['prompt_menu-default'], lambda: None, lambda: {'choices': utils.get_available_prompts()}, 'refresh-button', interactive=not mu)
+                    shared.gradio['refresh_prompt-default'] = ui.create_refresh_button(shared.gradio['prompt_menu-default'], lambda: None, lambda: {'choices': utils.get_available_prompts()}, 'refresh-button', interactive=not mu)
                     shared.gradio['new_prompt-default'] = gr.Button('New', elem_classes='refresh-button', interactive=not mu)
                     shared.gradio['rename_prompt-default'] = gr.Button('Rename', elem_classes='refresh-button', interactive=not mu)
                     shared.gradio['delete_prompt-default'] = gr.Button('🗑️', elem_classes=['refresh-button', 'delete-icon-btn'], interactive=not mu)
@@ -77,10 +77,15 @@ def create_ui():
 
 def create_event_handlers():
     ui_sentence_rewrite.create_event_handlers('default')
+    rewrite_ui, _ = shared.gradio['rewrite-ui-default']
+    generation = rewrite_ui['generation_dispatch'](generate_reply_wrapper)
+    generation_inputs = [shared.gradio['textbox-default'], *rewrite_ui['generation_inputs']]
+    continue_inputs = [shared.gradio['output_textbox'], *rewrite_ui['generation_inputs']]
     shared.gradio['Generate-default'].click(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
         lambda: [gr.update(visible=True), gr.update(visible=False)], None, gradio('Stop-default', 'Generate-default')).then(
-        generate_reply_wrapper, gradio('textbox-default', 'interface_state'), gradio(outputs), show_progress=False).then(
+        generation, generation_inputs, rewrite_ui['generation_outputs'], show_progress=False).then(
+        rewrite_ui['generation_commit'], rewrite_ui['generation_commit_inputs'], rewrite_ui['generation_commit_outputs'], show_progress=False).then(
         lambda state, left, right: state.update({'textbox-default': left, 'output_textbox': right}), gradio('interface_state', 'textbox-default', 'output_textbox'), None).then(
         lambda: [gr.update(visible=False), gr.update(visible=True)], None, gradio('Stop-default', 'Generate-default')).then(
         None, None, None, js=f'() => {{{ui.audio_notification_js}}}')
@@ -88,7 +93,8 @@ def create_event_handlers():
     shared.gradio['textbox-default'].submit(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
         lambda: [gr.update(visible=True), gr.update(visible=False)], None, gradio('Stop-default', 'Generate-default')).then(
-        generate_reply_wrapper, gradio('textbox-default', 'interface_state'), gradio(outputs), show_progress=False).then(
+        generation, generation_inputs, rewrite_ui['generation_outputs'], show_progress=False).then(
+        rewrite_ui['generation_commit'], rewrite_ui['generation_commit_inputs'], rewrite_ui['generation_commit_outputs'], show_progress=False).then(
         lambda state, left, right: state.update({'textbox-default': left, 'output_textbox': right}), gradio('interface_state', 'textbox-default', 'output_textbox'), None).then(
         lambda: [gr.update(visible=False), gr.update(visible=True)], None, gradio('Stop-default', 'Generate-default')).then(
         None, None, None, js=f'() => {{{ui.audio_notification_js}}}')
@@ -96,12 +102,13 @@ def create_event_handlers():
     shared.gradio['Continue-default'].click(
         ui.gather_interface_values, gradio(shared.input_elements), gradio('interface_state')).then(
         lambda: [gr.update(visible=True), gr.update(visible=False)], None, gradio('Stop-default', 'Generate-default')).then(
-        generate_reply_wrapper, gradio('output_textbox', 'interface_state'), gradio(outputs), show_progress=False).then(
+        generation, continue_inputs, rewrite_ui['generation_outputs'], show_progress=False).then(
+        rewrite_ui['generation_commit'], rewrite_ui['generation_commit_inputs'], rewrite_ui['generation_commit_outputs'], show_progress=False).then(
         lambda state, left, right: state.update({'textbox-default': left, 'output_textbox': right}), gradio('interface_state', 'textbox-default', 'output_textbox'), None).then(
         lambda: [gr.update(visible=False), gr.update(visible=True)], None, gradio('Stop-default', 'Generate-default')).then(
         None, None, None, js=f'() => {{{ui.audio_notification_js}}}')
 
-    shared.gradio['Stop-default'].click(stop_everything_event, None, None, queue=False)
+    shared.gradio['Stop-default'].click(stop_notebook_generation, rewrite_ui['session'], rewrite_ui['status'], queue=False, api_name=False)
     shared.gradio['markdown_render-default'].click(lambda x: x, gradio('output_textbox'), gradio('markdown-default'), queue=False)
     shared.gradio['prompt_menu-default'].change(lambda x: (load_prompt(x), ""), gradio('prompt_menu-default'), gradio('textbox-default', 'output_textbox'), show_progress=False)
     shared.gradio['new_prompt-default'].click(handle_new_prompt, None, gradio('prompt_menu-default'), show_progress=False)
