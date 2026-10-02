@@ -2,6 +2,10 @@
 
 **A desktop app for local LLMs. Open source, no telemetry.** Text, vision, tool-calling, web search. UI + API.
 
+This fork adds [Notebook sentence rewriting](docs/Notebook-Rewrite.md). For future
+upstream releases, see the [fork maintenance guide](docs/UPSTREAM-MAINTENANCE.md)
+and [agent instructions](AGENTS.md).
+
 [![GitHub stars](https://img.shields.io/github/stars/oobabooga/textgen?style=for-the-badge&logo=github&logoColor=white&labelColor=black)](https://github.com/oobabooga/textgen)
 
 [![Chat mode](https://raw.githubusercontent.com/oobabooga/screenshots/refs/heads/main/CHAT-4.8.png)](https://raw.githubusercontent.com/oobabooga/screenshots/refs/heads/main/CHAT-4.8.png)

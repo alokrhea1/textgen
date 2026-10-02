@@ -1,5 +1,11 @@
 # Notebook retrieval rewrite: implementation plan
 
+**Historical design record.** This is the original implementation plan, not the
+current maintenance specification. Retrieval dependencies are now included in
+supported installation profiles (model loading remains lazy), and LateOn plus
+STS/NLI reranking is implemented. See [current behavior](Notebook-Rewrite.md) and
+the [upstream maintenance guide](UPSTREAM-MAINTENANCE.md) before changing the fork.
+
 Upstream baseline: `c93f8871239550de2ccfe1e95d469aa82616f07e`.
 
 The requested workflow is an explicit Rewrite button in a sixth Notebook subtab. A local TXT corpus supplies top-K examples for regenerating the last completed period-delimited sentence. Users may edit a seed sentence and repeat indefinitely. Ordinary generation must remain unchanged.
