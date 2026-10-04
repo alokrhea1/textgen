@@ -7,7 +7,8 @@ release is a separate maintenance task.
 Read [the upstream maintenance guide](docs/UPSTREAM-MAINTENANCE.md) before changing
 upstream integration, dependencies, installers, or backend adapters. Read
 [the current feature guide](docs/Notebook-Rewrite.md) for shipped behavior.
-`docs/Notebook-Rewrite-Plan.md` is historical, not the current specification.
+Refer to [the developer guide](docs/Rewrite-Development.md) for code contracts and
+verification procedures.
 
 ## Contracts to preserve
 

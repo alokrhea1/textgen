@@ -18,11 +18,10 @@ integration and backend hardening). They explain the original patch, but future
 updates must compare against the current sync record rather than replaying those
 two commits or assuming this list is exhaustive.
 
-[Notebook-Rewrite.md](Notebook-Rewrite.md) describes current behavior, tested
-combinations, and limitations. [Notebook-Rewrite-Plan.md](Notebook-Rewrite-Plan.md)
-is historical. Preserve the native integration; this feature uses the loaded
-generation model and its normal templates/samplers rather than a separate text
-generation service.
+[Notebook-Rewrite.md](Notebook-Rewrite.md) gives user instructions.
+[Rewrite-Development.md](Rewrite-Development.md) gives code contracts, verification
+procedures, and runtime coverage. Keep the native integration with the loaded
+model, templates, and samplers.
 
 ## Inspect a candidate without changing application code
 
@@ -111,7 +110,8 @@ main conflict risk:
   and backbone query/document length and expansion settings. Check these APIs,
   role prompts, trained projections and punctuation retention against real token
   matrices after a library upgrade.
-- Current platform choices and exact tested versions are in the feature guide.
+- Platform choices are in the user guide. Recorded runtime versions are in the
+  developer guide.
   Windows AMD retrieval currently uses CPU; Apple MPS uses exact CPU matching;
   Intel macOS is unsupported by the current dependency stack. Reassess with
   evidence when upstream changes rather than silently restoring incompatible pins.
@@ -162,7 +162,7 @@ The real retrieval check loads LateOn and both rerankers; omit `--offline` only
 when downloading models is allowed. Use `--device cpu` for a CPU profile.
 
 Run `tests/manual/rewrite_browser.py` against a scratch server with a real model
-loaded, following the feature guide. Verify both Notebook layouts, build lock and
+loaded, with the procedure in the developer guide. Verify both Notebook layouts, build lock and
 retry, seeds/repetition, Stop/retry, review conflicts, undo, exact token matching,
 incomplete/custom-stop errors, and ordinary generation after Rewrite. Exercise
 each changed loader and dependency profile; do not infer new binary/Transformers
@@ -172,7 +172,7 @@ change merits a browser run even when the unit suite passes.
 For automatic per-sentence generation, inspect and run the corresponding
 `test_rewrite_automatic.py` and automatic UI checks as well. Run
 `tests/manual/rewrite_automatic_browser.py` against the same kind of scratch
-server, following the feature guide. A live browser check
+server, with the procedure in the developer guide. A live browser check
 must show Generate/Shift+Enter in both layouts, single-column Regenerate restoring the
 last input, and two-column Continue using output even when empty,
 continuation from each rewritten sentence, completion/replacement of an initial
@@ -210,8 +210,8 @@ adapters and sampling hooks relevant to the change. Run clean install/update
 checks for affected full and portable profiles, including Gemma override handling;
 build each changed distribution where a suitable runner is available. Update the
 validation matrix honestly for unavailable platforms rather than claiming they
-passed. Historical pass counts in the guide are evidence for their recorded
-versions, not an acceptance threshold for the next update.
+passed. Previous results do not show compatibility with the selected upstream
+release. Record the checks completed for that release.
 
 ## Finish and leave a record
 
@@ -224,7 +224,7 @@ versions, not an acceptance threshold for the next update.
    merge commit here. Stage this record with the completed integration. During a
    `--no-commit` merge, HEAD still names the old fork commit; rerun the helper with
    the new baseline after completing the merge commit.
-3. Update the feature guide's compatibility/validation matrix and release notes:
+3. Update the developer guide's runtime coverage. Update the release notes:
    upstream tag/SHA, important conflict resolutions, dependency/model changes,
    cache migration/rebuild implications, commands/results and unverified cases.
    Inspect both `git diff --check` and `git diff --cached --check`, plus

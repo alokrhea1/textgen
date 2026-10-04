@@ -461,7 +461,8 @@ To pass extra flags, put each on its own line:
 
 https://github.com/oobabooga/textgen/wiki
 
-[Notebook sentence rewriting](docs/Notebook-Rewrite.md): manual local-corpus retrieval, model setup, and rewrite controls.
+[Notebook sentence rewriting](docs/Notebook-Rewrite.md): local-corpus setup, manual Rewrite, and automatic sentence rewriting.
+[Rewrite development](docs/Rewrite-Development.md): code contracts, verification, and runtime coverage.
 
 ## Community
 

@@ -3,7 +3,6 @@
 This guide gives the code structure, maintenance contracts, and validation record for Notebook Rewrite.
 For instructions and initial control values, refer to [the user guide](Notebook-Rewrite.md).
 For screening rules and evaluation, refer to [the quality guide](Rewrite-Quality.md).
-The [initial plan](Notebook-Rewrite-Plan.md) records the initial design.
 [Upstream maintenance](UPSTREAM-MAINTENANCE.md) gives the procedure for integration with a subsequent upstream release.
 
 ## Technical terms
@@ -283,43 +282,33 @@ Manual checks include build/retry, preview, seeds, rewrites, review/apply/undo, 
 Automatic checks include the six generation routes, sentence cycles, source selection, locks, Stop/retry, undo, and checkbox-off behavior.
 Relaxed acceptance settings show the operation of controls. They do not show retrieval quality.
 
-### Recorded validation
+### Runtime coverage
 
-These results are from previous development sessions.
-They are not results from this checkout or environment.
-The test count does not show compatibility after a dependency or upstream change.
+Previous runtime checks used Linux with NVIDIA GPUs.
+These records do not show compatibility after code or dependency changes.
+Do the applicable checks again for the selected environment.
 
-| Recorded scope | Result and limits |
+| Mode | Model and loader coverage |
 | --- | --- |
-| Automatic extension | 510 tests and 17 subtests, with the explicit CUDA scoring check. |
-| Quality version 2 | 339 tests and 17 subtests. [The quality record](Rewrite-Quality.md#recorded-validation) gives retrieval evidence and limitations. |
-| Previous backend and installation work | 210 checks and 17 subtests. These checks came before quality screening and automatic mode. |
-| Automatic and manual browser regression | Linux with two NVIDIA A40 GPUs. Gemma 4 12B IT BF16 through Transformers, and Mistral-Nemo-Instruct-2407 Q4_K_M through llama.cpp. |
-| Previous manual browser coverage | Nemo BF16 through Transformers, ExLlamav3, and ExLlamav3_HF. Nemo GGUF through llama.cpp and ik_llama.cpp. |
-| TensorRT-LLM | Controlled adapter and worker tests. No completed real engine build or generation validation. |
+| Automatic and manual Rewrite | Gemma 4 12B IT BF16 through Transformers. Mistral-Nemo-Instruct-2407 Q4_K_M through llama.cpp. |
+| Other manual Rewrite coverage | Nemo BF16 through Transformers, ExLlamav3, and ExLlamav3_HF. Nemo GGUF through ik_llama.cpp. |
+| TensorRT-LLM | Controlled adapter and worker tests only. No completed real engine build or generation validation. |
 
-The automatic browser environment used Python 3.12.3 and PyTorch 2.8.0+cu128.
-It also used Transformers 5.10.4, Sentence Transformers 6.1.0, and Gradio 4.37.2+custom.21.
-The llama.cpp binaries were 0.138.0 CUDA 12.4.
-Recorded settings were seed 42, temperature 0.3, 150 new tokens, streaming enabled, and thinking disabled.
-Retrieval used `cuda:1`.
-Initial acceptance settings rejected the first synthetic draft for insufficient reference length and kept the initial text.
-Relaxed settings used the control routes.
+The automatic checks used Python 3.12.3, PyTorch 2.8.0+cu128, and Transformers 5.10.4.
+They also used Sentence Transformers 6.1.0, Gradio 4.37.2+custom.21, and llama.cpp binaries 0.138.0 CUDA 12.4.
 
-Controlled fixtures included retention after accepted sentences and edits during operations.
+Linux Python 3.13 installation checks included these profiles:
 
-Linux Python 3.13 installations in different environments also passed checks for these profiles:
-
-| Profile | Recorded packages and exercised scope |
+| Profile | Packages and scope |
 | --- | --- |
-| CUDA 12.4 portable | PyTorch 2.6.0+cu124, Transformers 5.6.2, Sentence Transformers 6.1.0. Dependency checks, imports, and browser workflow with GPU generation and retrieval. |
-| CPU portable | PyTorch 2.9.0+cpu with the same Transformers and Sentence Transformers versions. Dependency checks, imports, and real LateOn/SQLite/MaxSim/STS/NLI retrieval. |
-| Full NVIDIA | PyTorch 2.9.0+cu128 with the same Transformers and Sentence Transformers versions. Nemo BF16 browser workflow with ExLlama 0.0.34 and Flash Attention 2.8.3. |
+| CUDA 12.4 portable | PyTorch 2.6.0+cu124. Dependency checks, imports, and browser workflow with GPU generation and retrieval. |
+| CPU portable | PyTorch 2.9.0+cpu. Dependency checks, imports, and real LateOn/SQLite/MaxSim/STS/NLI retrieval. |
+| Full NVIDIA | PyTorch 2.9.0+cu128. Nemo BF16 browser workflow with ExLlama 0.0.34 and Flash Attention 2.8.3. |
 
-Windows, macOS, ROCm, CUDA 13.1, Docker builds, and Colab execution had no runtime validation on that host.
-TorchAO-quantized checkpoints had no validation in those model runs.
+Those installation checks used Transformers 5.6.2 and Sentence Transformers 6.1.0.
+Windows, macOS, ROCm, CUDA 13.1, Docker builds, and Colab execution had no runtime validation in those checks.
+TorchAO-quantized checkpoints also had no validation.
 Do checks for other models, extensions, samplers, and automatic-mode loaders before their first operation.
-Private evidence paths from previous sessions are not necessary for installation.
 
 ## Corpus preparation tools
 
@@ -339,7 +328,6 @@ The source and output directories must be different. Neither directory can conta
 The script does not change source files.
 Corpus paths select the prepared author directories, without the source notices or manifest.
 Examine the source license before distribution.
-The previous literary experiment used an embedding limit of 384. The UI initial value stays 256.
 
 `tests/manual/prepare_nabokov_corpus.py` processes one previously examined user-supplied OCR edition with fixed text markers.
 It is not a general book extraction tool.
@@ -350,7 +338,3 @@ It does not give redistribution permission.
 python tests/manual/prepare_nabokov_corpus.py \
   --source /path/to/source.txt --output-dir /path/to/prepared
 ```
-
-The previous 72-output author comparison had no reference snapshots and used additional guidance for one author.
-It cannot show corpus effects alone or give a general model ranking.
-Its references came before quality screening.

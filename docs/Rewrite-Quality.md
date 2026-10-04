@@ -193,29 +193,3 @@ Examine exclusions, offsets, duplicate source records, and windows near rejected
 Make sure that correct text stays available and retrieval refusal prevents generation without text changes.
 Refer to [Rewrite development](Rewrite-Development.md) for regression checks.
 The lead agent does tests, as specified in [AGENTS.md](../AGENTS.md).
-
-## Recorded validation
-
-The repository recorded these quality-version-2 results before this documentation change.
-They do not validate this checkout.
-Source passages and result files are not available here.
-
-| Check | Recorded result |
-| --- | --- |
-| Regression suite with `REWRITE_TEST_CUDA=1` | 339 tests and 17 subtests passed. No CUDA check was skipped. |
-| Fixture retention | Eight correct-text probes and four damaged-boundary probes passed. |
-| Fixture ranking | A labeled related passage ranked first for eight applicable queries. Discouraged references decreased from nine to zero. |
-| Unrelated query | The previous configuration supplied five references. Quality controls gave a no-reference error. |
-| Nabokov corpus | 4,518 spans checked. 155 rejected. 4,363 occurrences kept. 4,336 different candidates. |
-| Eight Nabokov queries | Three returned no references. A memory query accepted an unsatisfactory reference. |
-| Pools of 200, 500, 1,000, and 2,000 | Larger pools did not improve all query results. The default stayed 200. |
-| Notebook workflow | The two layouts and usual generation passed with Gemma 4 12B IT, BF16, and Transformers. |
-
-The fixture comparison used LateOn, real STS/NLI models, symmetric scoring, one-sentence windows, and `scanned_book` cleanup.
-The two runs used 384 embedding tokens, batch size 16, K of 5, and a pool of 200.
-The fixture hash was `59d2048d501a9e88dd32c6f562725538dcf7857bb30e176c53b566a82bca24ed`.
-The environment used PyTorch 2.8.0+cu128, Transformers 5.10.4, and Sentence Transformers 6.1.0.
-The previous retrieval revision was `003ccab527a104e0f1d4c4a7217b910709d12497`.
-The next run used `balanced`, length ratio 0.5, minimum STS 0.3, and maximum contradiction 0.8.
-
-These observations do not measure general style improvement, detection of all OCR damage, or false-exclusion rate.
