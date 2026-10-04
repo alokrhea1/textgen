@@ -240,8 +240,14 @@ def create_ui(mode='notebook'):
         control('auto_max_sentences', gr.Slider(1, 100, step=1, value=5,
                                                label='Maximum sentences per automatic generation',
                                                info='Each newly completed sentence is rewritten before the next sentence is generated. Stop keeps completed rewrites and discards unfinished drafts.'))
+        relative_example = Path('user_data') / 'corpus.txt'
+        absolute_example = Path.cwd() / relative_example
         control('paths', gr.Textbox(label='Local .txt files or directories — one path per line', lines=3,
-                                   value=defaults['paths'], info='Paths are on the server. Relative paths start in the application directory.'))
+                                   value=defaults['paths'],
+                                   placeholder=f'{relative_example}\n{absolute_example}',
+                                   info=f'Paths refer to files on this server. Relative paths start from {Path.cwd()}. '
+                                        f'Relative example: {relative_example}. Absolute example: {absolute_example}. '
+                                        'On Linux/macOS, start an absolute path with /.'))
         with gr.Row():
             control('recursive', gr.Checkbox(label='Include subdirectories', value=defaults['recursive']))
             control('force', gr.Checkbox(label='Force rebuild', value=False))
