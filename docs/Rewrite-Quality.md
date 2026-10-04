@@ -1,53 +1,75 @@
 # Corpus quality and reference acceptance
 
-The earlier literary comparison exposed two separate failures: OCR damage created apparently complete reference sentences, and retrieval could fill K with short or weak matches. This change screens candidate occurrences before embedding, then applies target-dependent length and semantic acceptance when searching. It preserves the existing period-based Notebook selection, trained token embeddings, native generation path, rewrite prompt, and review/apply/undo workflow.
+This developer guide gives information about corpus screening and reference acceptance.
+For user instructions, refer to [Notebook Rewrite](Notebook-Rewrite.md).
 
-## Plan and design decisions
+## Corpus screening
 
-1. Run every corpus through shared formatting cleanup, period segmentation, and inspectable quality screening. Keep source files unchanged and map retained/excluded occurrences to original decoded character offsets.
-2. Exclude narrowly recognized damage before embedding, with reasons and neighboring context. Keep legitimate short text; its suitability depends on the target. Exclude windows containing rejected spans without joining across them.
-3. Require useful reference substance relative to the target in sentence mode. Retain exact generation-token matching and tolerance in token mode.
-4. Permit fewer than K references and an explicit no-reference outcome. Expose all model score components and make acceptance thresholds adjustable.
-5. Compare old-style and new settings on original diagnostic text and separately on local literary corpora. Inspect both removed damage and incorrectly excluded legitimate writing. Run regression checks and independent source/workflow reviews before publishing.
-
-The resulting pipeline is:
+Each corpus uses this sequence:
 
 ```text
-UTF-8 source → shared formatting cleanup → period spans + neighboring context
-            → occurrence quality flags / exclusions → eligible sentence windows
-            → trained token matrices in SQLite
-
-target → length eligibility → exact late-interaction scan → STS/NLI reranking
-       → reference acceptance → up to K references → existing rewrite prompt
+UTF-8 source → formatting cleanup → period spans → quality screening
+            → sentence windows → token embeddings → SQLite cache
 ```
 
-### Research that informed the choices
+The system does not change source files.
 
-Unicode describes the ambiguity of periods and the need to tailor sentence boundaries to an application. Our design keeps the user's period-based Notebook behavior and adds a separate corpus-quality decision; it does not claim Unicode sentence-boundary conformance. [Unicode UAX #29, sentence boundaries](https://unicode.org/reports/tr29/#Sentence_Boundaries)
+| Screening policy | Result |
+| --- | --- |
+| `balanced` (default) | Records flags. Does not use passages with damage flags. |
+| `off` | Records flags. Keeps passages with damage flags. Index limits do not change. |
 
-OCR detection and correction are separable tasks. Schaefer and Neudecker report that detecting erroneous sequences before correcting them reduces false changes to correct characters. That supports the decision to identify suspect source passages first. The implementation here uses narrow, inspectable rules and excludes suspect occurrences; it does not implement their learned corrector or infer missing prose. [A Two-Step Approach for Automatic OCR Post-Correction](https://aclanthology.org/2020.latechclfl-1.6/)
+After a policy change, build the corpus again.
+Use `off` if screening rejects correct text.
 
-Sentence Transformers' multi-vector interface retains token vectors and uses MaxSim, with model-specific query/document roles. This remains the retrieval foundation. Replacing trained token representations with average sentence vectors would not address malformed source candidates. [Multi-vector encoder usage](https://sbert.net/docs/multi_vector_encoder/usage/usage.html)
+Quality version 2 uses these flags:
 
-LightOn reports strongly anisotropic token spaces in several ColBERT models, including LateOn. That is one reason raw cosine-derived scores should not be presented as calibrated relevance. Their investigation concerns efficient approximate retrieval; our exact scan does not use those approximations, and the report alone does not establish the cause of any particular literary ranking. No unvalidated centering or embedding transformation is applied here. [LightOn's late-interaction regularization investigation](https://huggingface.co/blog/lightonai/lateon-regularization)
+| Flag | Condition | Cleanup mode |
+| --- | --- | --- |
+| `short_reference` | Maximum four character runs and 24 letters. This flag does not reject text. | All |
+| `replacement_character` | Unicode replacement character U+FFFD. | All |
+| `control_character` | A control character other than whitespace, or an incorrect Unicode surrogate. | All |
+| `punctuation_fragment` | All characters that you can see are punctuation. | All |
+| `symbol_noise` | A high separator-symbol ratio. | `scanned_book` |
+| `suspicious_boundary` | A short lowercase passage after a passage that starts with an uppercase letter. There are more conditions. | `scanned_book` |
+| `dangling_function_boundary` | English `if`, `in`, `of`, or `to` before a lowercase continuation. There are more conditions. | `scanned_book` |
+| `ocr_quote_digit` | One ASCII quotation digit or contraction digit `5` in a specified English pattern. | `scanned_book` |
+| `leading_digit_paragraph` | A single initial digit before a paragraph break and prose. | `scanned_book` |
 
-Research on syntactic-template retrieval explicitly optimizes the usefulness of templates for generated paraphrases. That is a different objective from semantic similarity. We therefore do not label STS/NLI ranking a literary-style optimizer or add an arbitrary “interestingness” bonus. A learned structure/style retriever would need its own data and evaluation of resulting rewrites. [A Quality-based Syntactic Template Retriever for Syntactically-Controlled Paraphrase Generation](https://aclanthology.org/2023.emnlp-main.604/)
+Refer to [quality.py](../modules/sentence_rewrite/quality.py) for the full conditions.
 
-### Ingestion policies and provenance
+Boundary checks flag the two adjacent passages.
+They do not use quotation, paragraph, or ellipsis boundaries.
+No indexed window contains a rejected passage or puts text together across it.
 
-`quality.py` runs for every corpus, independently of whether formatting cleanup is `none`, `conservative`, or `scanned_book`. `balanced` is the default policy; `off` records flags but excludes nothing on quality grounds. Changing policy requires a rebuild. Cleanup changes remain governed by the existing cleanup setting.
+Counts measure character runs, not words.
+Short text, lowercase text, and different scripts can stay indexed.
+English scan rules can miss damage or reject correct prose, such as numbered headings.
+They do not repair text.
 
-Balanced screening excludes replacement/control-character damage and punctuation-only spans. Quality version 2 applies additional rules only with `scanned_book`: concentrated separator noise, some suspicious adjacent period boundaries, passages ending in English `if`/`in`/`of`/`to` before a lowercase continuation, and narrowly defined digit-for-quote/contraction patterns. The function-word check also applies to longer passages with uppercase letters; it is not restricted to a standalone word. The quotation pattern recognizes one ASCII digit, while the contraction pattern remains restricted to `5` in its recognized English context. A detached single leading digit followed by a paragraph break and prose is separately flagged. Such a digit can also be an intentional numbered heading, so inspect exclusions.
+## Source records and cache
 
-Both sides of a suspect sentence boundary are flagged. Paragraph, quotation, and ellipsis boundaries are handled conservatively. These rules cannot detect all OCR damage and can still reject deliberate literary constructions. `off` is the escape hatch when inspection shows unwanted exclusions.
+Each occurrence records its source path, initial character offsets, flags, and maximum 200 cleaned characters on each side.
+`excluded_spans` contains rejected text and reasons.
+The same accepted passages share one embedding and keep different source records.
 
-Short sentences remain indexable. The `short_reference` flag is informational, not a rejection reason. Letter/run counts are Unicode character statistics, not linguistic word segmentation; they do not establish sentence quality. Lowercase writing and non-Latin scripts are not rejected merely for being lowercase, unfamiliar, or unspaced. The scan-specific rules include English assumptions and are not a multilingual OCR detector.
+The UI shows cleaned text.
+Offsets identify decoded source characters and include a byte-order mark if the source contains one.
+They do not identify bytes or cleaned-text positions.
 
-Each occurrence retains source path, original start/end character offsets, quality flags, and up to 200 characters of cleaned context on either side. Excluded spans additionally retain their text and exclusion reasons in `excluded_spans`. Identical accepted passages still share an embedding while keeping occurrence provenance. An exclusion at one location does not exclude an intact identical passage elsewhere. Windows containing a rejected span are blocked, including windows that begin before it.
+Schema 2 adds audit fields and content-token counts.
+Source hashes, model identity, settings, and cleanup/quality versions determine cache identity.
+**Build corpus / retry** rebuilds caches with a previous schema.
+If a build has an error, the previous completed cache stays available.
+If screening rejects all completed spans, the build deletes its temporary database.
+The UI keeps counts and samples for retry.
 
-Schema 2 adds these audit fields and embedding content-token counts. Cleanup version, quality version/policy, model identity, source hashes, and other build settings participate in the cache signature. Normal **Build corpus / retry** rebuilds older-schema caches; publication remains transactional. A failed build preserves the previous completed cache. When all complete spans are rejected, the UI keeps an actionable quality report and permits retry rather than publishing an empty index. That failed build's staged database is removed, so only the bounded report remains available from it.
+### Examine exclusions
 
-The UI report intentionally shows aggregate counts and a few samples, not the whole source corpus. On a completed cache, maintainers can inspect every rejected occurrence read-only. Supply the exact cache path rather than guessing which database belongs to a current tab:
+A completed cache contains all rejected occurrences.
+
+1. Replace the example path below with the completed cache path for the selected Notebook tab.
+2. Run this command:
 
 ```sh
 python - /absolute/path/to/completed-corpus.sqlite <<'PY'
@@ -73,67 +95,127 @@ with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
 PY
 ```
 
-The output contains corpus text and server-local paths. Keep it with the private validation artifacts rather than committing it. For retained occurrences, join `occurrences.candidate` to `candidates.id`; `occurrences.quality_flags` and its context fields describe that particular location. Displayed spans and context are cleaned text; `start`/`end` address the original decoded Unicode text, including a BOM if present, not bytes or the cleaned string.
+Keep the output, with corpus text and server paths, in a directory that is not in the repository.
+For accepted text, join `occurrences.candidate` to `candidates.id`.
+Examine `occurrences.quality_flags`, `context_before`, and `context_after` for each location.
 
-### Query-dependent acceptance
+## Reference acceptance
 
-The UI's sentence-mode **Minimum reference length relative to target** defaults to 0.5. It compares embedding content-token counts, computed as token count minus the empty document's marker/special-token overhead. It is only a lower bound: a reference can be longer than the target. Zero disables it. Generation-token mode continues to use the current backend's exact token count and the selected tolerance; this floor does not apply there. Lowering the floor can be useful for deliberately terse references.
-
-Top K remains 5 and the reranking pool remains 200 by default. Exact late interaction considers all eligible candidates, but STS/NLI sees only that retained pool. Raising the pool can recover a useful candidate ranked below the cutoff; it also increases inference cost. These defaults are not established as optimal for literary corpora.
-
-With nuance reranking enabled, the UI defaults to STS similarity at least 0.3 and contradiction at most 0.8. The existing bidirectional composite score orders survivors. Minimum 0 and maximum 1 respectively disable those filters; disabling nuance makes both inactive. Fewer qualifying candidates means fewer references, and no qualifying candidate means a visible failure before generation. There is no fallback that substitutes rejected references to fill K.
-
-These scores are raw model outputs transformed as described in the feature guide, not calibrated confidence or guarantees of equivalent meaning. The English STS/NLI checkpoints can reject good indirect stylistic analogies and perform poorly for other languages. Acceptance is configurable, and preview remains essential. There is no automatic corpus-specific threshold calibration and no explicit syntax/style ranker in this change.
-
-## Reproducible evaluation
-
-`tests/fixtures/rewrite_quality_cases.json` contains repository-original passages and diagnostic labels: contrasting composition, role reversal, negation, quantities, legitimate short replies, lowercase and non-Latin text, damaged period boundaries, uncertain broken spelling, and an unrelated query. These labels are small inspection probes, not a calibrated literary-quality benchmark or exhaustive judgments of all acceptable references.
-
-The lead agent runs `tests/manual/rewrite_quality.py` with real models. Each run requires an empty output directory and writes `results.json`, model/source/settings identities, query references and raw source spans, retention probes for the synthetic fixture, timing, errors, and optional factual differences from an earlier run. A completed script or improved label count does not establish a general quality improvement. It evaluates retrieval; it does not run or grade sentence generation.
-
-Retention probes declare any required cleanup/policy settings. `applicable` is false and `expectation_met` is JSON `null` when a probe's requirements do not match the evaluated configuration; this is neither a pass nor a failure. Inspect `probe_evaluation_policy` and the actual manifest configuration. For a legacy checkout that lacks `quality_policy`, the requested policy identifies the intended evaluation target only: it does not mean that checkout applied screening. The evaluator records that distinction rather than crediting a nonexistent feature.
-
-For example, in the activated textgen environment with all three retrieval models cached:
-
-```sh
-python tests/manual/rewrite_quality.py --device cuda:1 --offline \
-  --cleanup scanned_book --quality-policy off --min-length-ratio 0 \
-  --min-semantic-score 0 --max-contradiction-score 1 \
-  --output-dir /workspace/rewrite-validation/quality-controls-off
-
-python tests/manual/rewrite_quality.py --device cuda:1 --offline \
-  --cleanup scanned_book \
-  --compare /workspace/rewrite-validation/quality-controls-off/results.json \
-  --output-dir /workspace/rewrite-validation/quality-balanced
+```text
+Target → length check → exact late-interaction scan → STS/NLI reranking
+       → score thresholds → maximum K references → rewrite prompt
 ```
 
-The first run approximates the old acceptance behavior on the new code; an actual old-checkout comparison must additionally record its revision and differences. Neither run should reuse a prior output directory. Use `--corpus /absolute/path/to/corpus.txt` (repeatable) to inspect local literary text separately. The fixture's relevance labels do not transfer to an external corpus. Keep private source passages and generated evidence outside the repository. To assess reranking-pool recall, repeat otherwise identical runs with `--rerank-pool 500` or another supported value and inspect changes rather than assuming a larger pool wins.
+| UI control | Default | Function |
+| --- | --- | --- |
+| **Top K references** | 5 | Maximum reference count. |
+| **Minimum reference length relative to target** | 0.5 | The reference must contain half the target's embedding content-token count or more. Sentence mode only. Zero disables this check. |
+| **Late-interaction candidates to rerank** | 200 | Candidate pool for STS/NLI reranking. |
+| **Minimum semantic similarity** | 0.3 | Rejects lower STS scores. Zero disables this filter. |
+| **Maximum contradiction score** | 0.8 | Rejects higher NLI contradiction scores. One disables this filter. |
 
-Maintainers should examine exclusions as well as results, and compare model identity/settings before attributing a change to ingestion. At minimum, verify damaged known boundaries stay out of embeddings, valid short/cased/uncased text remains usable, raw offsets are correct, duplicates retain occurrence-specific decisions, no window bridges an exclusion, and a weak-match refusal prevents generation without losing notebook text. Regression checks must cover normal token matching, both Notebook layouts, prompt budgeting, failure/retry, cancellation, review/apply/undo, and ordinary generation.
+Content-token count subtracts the empty document's marker and special-token count from the embedding token count.
+The ratio sets no maximum.
+Token mode uses the generation backend's token count and tolerance and does not use the ratio.
 
-### Current validation record
+The exact scan scores all candidates that the selected length and exact-copy filters accept.
+STS/NLI uses only the selected pool: UI range 5–500, module/script maximum 2,000.
+A larger pool increases computation and can find satisfactory references below the previous cutoff.
 
-The full Nabokov reranking-pool comparison inspected pools of 200, 500, 1,000, and 2,000 candidates. It did not show a consistent retrieval benefit from enlarging the pool, so the default remains 200. This does not establish that 200 is optimal for other queries or corpora, nor that reference style is adequately ranked.
+The score filters operate only with **Rerank for meaning and nuance**.
+Disabled reranking disables the two filters.
+The maximum reference count is K.
+If the system rejects all references, generation does not start.
+It does not add rejected references to fill K.
 
-The lead agent completed the quality-version-2 regression and retrieval checks below. The JSON artifacts record source hashes, code hashes, model identities, library versions, settings, and individual results. Private corpus passages remain outside the repository.
+STS is semantic textual similarity.
+NLI is natural language inference.
+Each model scores the two pair directions.
 
-| Evidence | Observed result |
+The semantic score is the mean STS value after sigmoid.
+Entailment uses the smaller NLI value.
+Contradiction uses the larger value.
+NLI values use softmax.
+The ranking score is:
+
+```text
+semantic + 0.25 × entailment − 0.25 × contradiction
+```
+
+Scores are not confidence percentages or a check for equivalent meaning.
+The default STS/NLI models use English.
+They can reject indirect references or give unsatisfactory results for different languages.
+No automatic threshold calibration or literary-style ranking is available.
+
+## Retrieval evaluation
+
+[rewrite_quality_cases.json](../tests/fixtures/rewrite_quality_cases.json) contains diagnostic text and labels.
+[rewrite_quality.py](../tests/manual/rewrite_quality.py) uses real retrieval models.
+It records model/source identities, settings, timing, errors, and retention probes in `results.json`.
+It does not measure generation or literary quality.
+Each run must use an empty output directory.
+
+1. Activate the textgen Python environment.
+2. Select two new output directories that are not in the repository.
+3. Run with quality controls disabled:
+
+```sh
+python tests/manual/rewrite_quality.py --device cuda:0 \
+  --cleanup scanned_book --quality-policy off --min-length-ratio 0 \
+  --min-semantic-score 0 --max-contradiction-score 1 \
+  --output-dir /tmp/rewrite-quality-controls-off
+```
+
+4. Run with the default quality controls:
+
+```sh
+python tests/manual/rewrite_quality.py --device cuda:0 \
+  --cleanup scanned_book \
+  --compare /tmp/rewrite-quality-controls-off/results.json \
+  --output-dir /tmp/rewrite-quality-balanced
+```
+
+Use `--device cpu` if CUDA is not available.
+Add `--offline` only when all three models are cached.
+
+The first configuration gives an approximation of previous acceptance behavior.
+For a previous checkout, record its revision and manifest settings.
+Code without `quality_policy` cannot use the requested policy.
+Retention probes with settings that do not agree give `applicable: false` and `expectation_met: null`, neither pass nor failure.
+
+Add `--corpus /absolute/path/to/corpus.txt` for external text.
+Use this argument again for more paths.
+Fixture labels do not measure external-corpus relevance.
+Use `--rerank-pool 500` for a pool comparison with the same settings.
+Keep passages and results in a directory that is not in the repository.
+
+Examine exclusions, offsets, duplicate source records, and windows near rejected spans.
+Make sure that correct text stays available and retrieval refusal prevents generation without text changes.
+Refer to [Rewrite development](Rewrite-Development.md) for regression checks.
+The lead agent does tests, as specified in [AGENTS.md](../AGENTS.md).
+
+## Recorded validation
+
+The repository recorded these quality-version-2 results before this documentation change.
+They do not validate this checkout.
+Source passages and result files are not available here.
+
+| Check | Recorded result |
 | --- | --- |
-| Automated regression suite, with `REWRITE_TEST_CUDA=1` | **339 passed and 17 subtests**, with no skipped CUDA check. |
-| Original nine-query fixture: ingestion | All **8 legitimate retention probes** stayed indexed; all **4 damaged-boundary probes** were excluded: **12/12 applicable probes** met their expectations. |
-| Original nine-query fixture: ranking | First labeled relevant reference remained **rank 1 for all 8 queries** with a labeled relevant passage. Labeled discouraged references across those queries fell from **9 to 0**. |
-| Original nine-query fixture: unrelated query | The baseline returned 5 references; the new configuration explicitly rejected retrieval with no qualifying references. |
-| Nabokov, one-sentence windows, quality version 2 | **4,518 sentence spans assessed**, **155 excluded**, **4,363 retained occurrences**, and **4,336 unique candidates**. Exclusion-reason counts overlap when a span has several flags. |
-| Nabokov, eight retrieval queries | **3/8 queries** returned an explicit no-reference result: expectation, institutional irony, and number. The degree query selected a useful 31-word reference first; the memory query still accepted a weak generic garden reference. |
-| Both Notebook layouts and ordinary-generation regression | Passed with Gemma 4 12B IT in BF16 through Transformers: indexing locks and failure/retry, preview, weak-reference refusal without editing, review/apply/undo, stale-edit protection, seed/repeat, Stop/retry, exact generation-token matching, and ordinary Generate. Both Notebook layouts passed Rewrite/Undo. |
-| Independent source and domain/workflow reviews | Three independent source, UI/workflow, and domain reviews approved after fixes, including the final quality-version-2 natural-corpus audit. |
+| Regression suite with `REWRITE_TEST_CUDA=1` | 339 tests and 17 subtests passed. No CUDA check was skipped. |
+| Fixture retention | Eight correct-text probes and four damaged-boundary probes passed. |
+| Fixture ranking | A labeled related passage ranked first for eight applicable queries. Discouraged references decreased from nine to zero. |
+| Unrelated query | The previous configuration supplied five references. Quality controls gave a no-reference error. |
+| Nabokov corpus | 4,518 spans checked. 155 rejected. 4,363 occurrences kept. 4,336 different candidates. |
+| Eight Nabokov queries | Three returned no references. A memory query accepted an unsatisfactory reference. |
+| Pools of 200, 500, 1,000, and 2,000 | Larger pools did not improve all query results. The default stayed 200. |
+| Notebook workflow | The two layouts and usual generation passed with Gemma 4 12B IT, BF16, and Transformers. |
 
-The synthetic comparison used the same fixture hash, `59d2048d501a9e88dd32c6f562725538dcf7857bb30e176c53b566a82bca24ed`, in the baseline and new runs. Both used LateOn with real STS/NLI rerankers on `cuda:1`, a 384-token embedding limit, batch size 16, symmetric scoring, top K 5, reranking pool 200, one-sentence windows, and `scanned_book` cleanup. The baseline ran the pre-change retrieval code at `003ccab527a104e0f1d4c4a7217b910709d12497` with the evaluator added. The new run enabled balanced screening, a 0.5 content-token length floor, minimum STS 0.3, and maximum contradiction 0.8. The environment recorded PyTorch 2.8.0+cu128, Transformers 5.10.4, and Sentence Transformers 6.1.0.
+The fixture comparison used LateOn, real STS/NLI models, symmetric scoring, one-sentence windows, and `scanned_book` cleanup.
+The two runs used 384 embedding tokens, batch size 16, K of 5, and a pool of 200.
+The fixture hash was `59d2048d501a9e88dd32c6f562725538dcf7857bb30e176c53b566a82bca24ed`.
+The environment used PyTorch 2.8.0+cu128, Transformers 5.10.4, and Sentence Transformers 6.1.0.
+The previous retrieval revision was `003ccab527a104e0f1d4c4a7217b910709d12497`.
+The next run used `balanced`, length ratio 0.5, minimum STS 0.3, and maximum contradiction 0.8.
 
-Local evidence paths are `/workspace/rewrite-validation/quality-baseline-final/results.json`, `/workspace/rewrite-validation/quality-verified/results.json`, and `/workspace/rewrite-validation/quality-nabokov-final/results.json`. The private `/workspace/literary-corpus/retrieval-quality-comparison.html`, linked from the historical `comparison.html`, presents the before/after references. These files contain source passages and should not be committed or redistributed with the public code.
-
-The browser workflow record is `/workspace/rewrite-validation/quality-browser-verified/browser-results.json`, with a screenshot in the same directory. It used isolated user data, Gemma on `cuda:0`, and retrieval on `cuda:1`. The browser fixture includes several valid alternatives so repeated rewrites can respect exact-copy exclusion and the new acceptance thresholds.
-
-The lowercase diagnostic query still accepted some loosely related references, despite retaining the correct reference first. The Nabokov results likewise show that excluding damaged spans and refusing weak matches does not solve literary-style ranking. These are small diagnostic observations, not a style benchmark or a measured false-exclusion rate over the whole corpus.
-
-The older 210-check/backend/installation record in [Notebook-Rewrite.md](Notebook-Rewrite.md) predates this change and does not validate these new heuristics or thresholds. No claim of literary-style superiority, universal OCR repair, or semantic perfection is made.
+These observations do not measure general style improvement, detection of all OCR damage, or false-exclusion rate.

@@ -1,213 +1,296 @@
 # Notebook sentence rewriting
 
-The **Rewrite** subtab is available in both Notebook layouts. It retrieves examples from local text files and uses the currently loaded generation model to replace the last complete sentence. You can also opt into rewriting each newly completed sentence during Notebook generation. Editing text alone never starts generation or rewriting.
+The **Rewrite** tab uses examples from a local text corpus to rewrite sentences with the loaded generation model.
+It is available in the two Notebook layouts.
+A corpus is a group of reference text files.
+A reference is a passage that the retrieval system selects from that corpus.
 
-## Install and first use
+Manual Rewrite replaces the last completed sentence.
+Automatic mode rewrites each new completed sentence during Notebook generation.
+Text edits, corpus builds, and reference previews do not start text generation.
 
-Supported full and portable installation profiles include Rewrite dependencies automatically. Use a portable artifact built from this fork: upstream release archives do not contain these changes. For an existing installation that lacks the dependencies, activate its textgen Python environment and install:
+For code changes, refer to [Rewrite development](Rewrite-Development.md).
+For screening rules and audits, refer to [Rewrite quality](Rewrite-Quality.md).
 
-```sh
-python -m pip install -r requirements/rewrite.txt
-```
+## Installation
 
-This adds Sentence Transformers and its dependencies; the installation profile selects PyTorch for your hardware. Model weights are separate downloads, and embeddings plus the optional reranker models can require substantial memory alongside your generation model. The UI selects CUDA when available, then Apple MPS, then CPU; saved device choices are preserved. Choose another available CUDA device to separate workloads. Retrieval uses PyTorch independently of the generation backend.
+Use an installation or portable archive from this fork.
+The supported installation profiles include the Rewrite dependencies.
+The system downloads model files before the first operation.
+Retrieval models use memory in addition to the generation model.
 
-| Installation profile | Rewrite retrieval device |
+To add missing Rewrite dependencies:
+
+1. Activate the textgen Python environment.
+2. Make sure that it contains PyTorch for your hardware.
+3. Install the Rewrite dependencies:
+
+   ```sh
+   python -m pip install -r requirements/rewrite.txt
+   ```
+
+Python 3.10 or a subsequent version is necessary.
+Rewrite does not support native Intel macOS.
+The full installer uses Python 3.13.
+
+Retrieval uses PyTorch independently of the generation backend.
+The initial device selection is CUDA, then Apple MPS, then CPU, if available.
+Saved corpus settings can change this selection.
+
+| Installation profile | Retrieval device |
 | --- | --- |
-| Portable CUDA 12.4 | CUDA, using CUDA 12.4 PyTorch 2.6. |
-| Portable CUDA 13.1 | CUDA, using CUDA 12.8 PyTorch 2.9 with CUDA 13.1-capable drivers. |
-| Linux AMD | ROCm 7.2 PyTorch; select the PyTorch `cuda` device name. |
-| Windows AMD | CPU; the bundled ROCm PyTorch distribution is Linux-only. GGUF generation retains its AMD backend. |
-| CPU or Vulkan | CPU PyTorch; Rewrite has no PyTorch Vulkan backend. |
-| Apple Silicon | MPS embeddings and reranking with exact CPU token matching, or entirely CPU. |
+| NVIDIA CUDA | CUDA. |
+| Linux AMD | ROCm. Select the PyTorch device name `cuda`. |
+| Windows AMD | CPU. |
+| CPU or Vulkan | CPU. |
+| Apple Silicon | MPS or CPU. MPS uses CPU for exact token matching. |
 
-Rewrite requires Python 3.10 or newer; the full installer uses Python 3.13. Native Intel macOS is unsupported and the one-click installer rejects it: the current Transformers stack requires PyTorch >=2.4, while Intel macOS wheels stop at 2.2.2. Use Linux with the CPU profile on Intel Mac hardware. Retained Apple Intel requirements files are legacy references.
+For Gemma 4 Unified, use a different environment with the usual textgen dependencies.
+Install `requirements/rewrite-gemma4.txt` in that environment.
+This file selects Transformers 5.10.4.
+One-click updates keep that selection.
+`REWRITE_GEMMA4=1` enables it, and `REWRITE_GEMMA4=0` selects the usual version.
+After a manual installation of the base dependencies, install the Gemma file again.
 
-For Gemma 4 12B Unified, use a separate environment with the normal webui dependencies installed, then install `requirements/rewrite-gemma4.txt`. This optional file includes the Rewrite dependencies and pins `transformers==5.10.4`, overriding the normal webui pin. One-click updates automatically preserve that exact installed override and record the selection; `REWRITE_GEMMA4=1` explicitly enables it, and `REWRITE_GEMMA4=0` restores the normal pin. Manual requirements reinstalls require reapplying the override. The Transformers loader selects the multimodal loading path specifically when the model configuration declares `gemma4_unified`.
+## Build a corpus
 
-Installation profile support describes dependency selection, not completed runtime validation on every platform or generation backend. See the validation section below for tested loaders and environments. TensorRT-LLM runtime verification remains pending.
+Corpus paths refer to files on the server.
+Relative paths start in the application directory.
+Files must use UTF-8. A UTF-8 byte-order mark is permitted.
+The system rejects symbolic links to files and explicit paths through symbolic links.
+It does not use symbolic links to subdirectories.
 
-1. Load your generation model and open Notebook → **Rewrite**.
-2. Enter local `.txt` files or directories, one path per line. These are server paths; relative paths start in the application directory. Files must be UTF-8 (a UTF-8 BOM is accepted). **Include subdirectories** defaults to enabled. Explicit symlink paths and symlink text files are rejected; symlink subdirectories are not traversed.
-3. Click **Build corpus / retry**. Status and progress describe loading, hashing, cleanup, sentence-quality screening, and embedding. Controls lock during operations and unlock on success or failure. Inspect both the **Cleanup report** and **Ingestion quality report** before retrieving from an unfamiliar corpus.
-4. Optionally click **Preview references** to inspect text, scores, source paths, and character offsets. Then click **Rewrite**.
-5. By default a successful proposal applies automatically. Enable **Review before applying** to inspect it and click **Apply rewrite** yourself. Application is refused if the notebook text, input, or selected prompt changed while the proposal was being prepared.
+1. Open Notebook.
+2. Select **Rewrite**.
+3. Enter one `.txt` file or directory path on each line.
+4. Select the corpus settings.
+5. Click **Build corpus / retry**.
+6. Examine the **Cleanup report**.
+7. Examine the **Ingestion quality report**.
 
-**Undo rewrite** retains up to 20 applied rewrites in the browser session and refuses to overwrite subsequent edits. Single-column Notebook uses its normal autosave; two-column output follows its existing persistence behavior. In the two-column layout, retrieval uses the output when nonempty, otherwise the input; the resulting document is written to output.
+**Include subdirectories** is initially enabled.
+Controls lock during a build and unlock at its end.
+If the build stops with an error, correct the cause.
+Then, start the build again.
+If a build has an error, the system keeps the previous completed cache.
+To use that cache, the settings and source files must be the same as before.
 
-## Which sentence changes
+**Build corpus / retry** uses a cache again if the settings and source files did not change.
+**Force rebuild** makes a new cache if the settings and source files are the same.
+**Clear this corpus** releases this tab's corpus and retrieval models.
+It deletes the selected cache only if no other Rewrite tab uses or builds it.
+The system does not change source files.
 
-Segmentation is deliberately period-based rather than linguistic. A terminating period, optionally followed by closing quotes or brackets, must be followed by whitespace or end of text. Question and exclamation marks alone do not complete a sentence. Ellipses can complete one; common abbreviations and single-letter initials are conservatively treated as incomplete, even at end of text. Dotted words remain intact. This can miss genuine endings such as `and so on etc.` or a sentence ending in `p.m.`; an earlier completed span may therefore remain the rewrite target.
+## Rewrite one sentence
 
-Only the last completed span is replaced. Every character outside it—including an unfinished trailing fragment, whitespace, and following punctuation—is preserved exactly. The replacement must contain exactly one complete period-terminated sentence. During streaming the system waits for confirmation beyond the period, or validates completion when generation ends.
+1. Load a generation model.
+2. Enter the text in Notebook.
+3. Click **Preview references**.
+4. Examine the reference text, scores, and source locations.
+5. Click **Rewrite**.
 
-An **Optional seed sentence** must itself be exactly one complete sentence. It temporarily substitutes for the target in the working document and becomes the retrieval query and generation target. It does not change the notebook until a successful rewrite is applied. The seed is cleared after application only if it has not changed since the rewrite began. **Optional writing guidance** steers composition; references are examples rather than instructions.
+An accepted rewrite applies immediately unless **Review before applying** is enabled.
+With that control enabled, **Apply rewrite** applies the proposal.
+If the input, output, or selected prompt changed during the operation, the system rejects application.
+**Undo rewrite** keeps a maximum of 20 changes in the browser session.
+It does not overwrite subsequent edits.
 
-## Automatic sentence rewriting during generation
+In the single-column layout, Rewrite uses the Notebook text.
+In the two-column layout, it uses output if the output contains text. If output is empty, it uses input.
+The system writes the result to output.
+The single-column layout uses its usual autosave.
+The two-column layout keeps its usual storage behavior.
 
-Build a corpus, then enable **Automatically retrieve and rewrite generated sentences** in the Notebook **Rewrite** subtab. The checkbox defaults to off and belongs to the current browser session; it is not saved as a corpus setting. With it enabled, **Generate** and **Shift+Enter** in either layout, single-column **Regenerate**, and two-column **Continue** draft one new completed sentence, retrieve references for it using the current Rewrite settings, rewrite it, and continue generation from the accepted rewritten document. Plain Enter inserts a newline; the existing Notebook shortcuts are preserved. The selected K, sentence/token matching, length and semantic acceptance settings, writing guidance, instruction-template selection, and rewrite thinking option all apply. The manual seed and **Review before applying** remain features of the manual Rewrite button and do not interrupt automatic generation.
+Source locations identify characters in the initial decoded text.
+They are not byte positions or positions in the cleaned text.
 
-Existing completed sentences in the starting document remain unchanged. If that document ends in an unfinished sentence, the model first completes that sentence and rewrites the whole completed span. Its initially typed unfinished prefix may therefore change. The same period-based completion rules used by manual Rewrite apply; an exclamation mark or question mark alone does not trigger a rewrite.
+### Sentence selection
 
-When **Use the selected instruction template** is enabled and a template is selected, drafting sends a continuation request through that template. After a completed sentence it asks for only the next sentence, without explanations, headings, or repeated input. For an unfinished sentence, it places the exact typed fragment at the beginning of the assistant's answer and lets the model generate only the missing suffix. That suffix is appended literally to the original document before retrieval, preserving whitespace and allowing partial-word completion without repairing words or inserting guessed spaces. The subsequent rewrite can still change the completed unfinished sentence, as described above. This helps instruction-following models continue prose rather than respond with advice.
+Only a terminating period completes a sentence.
+The period can have closing quotes or brackets after it.
+Whitespace or the end of the text must come after that boundary.
+Question marks and exclamation marks do not complete a sentence without a period.
+Ellipses can complete one.
+Some abbreviations and initials can prevent sentence completion at the end of the text.
 
-The unfinished fragment is supplied as an answer prefix only when the rendered template is outside an active reasoning region and the fragment contains no recognized reasoning/control markers. Otherwise drafting asks for the entire completed sentence beginning with the exact fragment, validates the final model output after extension hooks, and extracts only its suffix. Internal and trailing whitespace must match literally; leading separator whitespace stays preserved in the original document. A changed or missing prefix fails visibly before retrieval.
+Manual Rewrite replaces only the last completed sentence.
+The system keeps all other characters the same.
+This includes a fragment after the selected span.
+The replacement must be one completed sentence with a terminating period.
 
-If the checkbox is disabled or no template is selected, drafting uses the ordinary raw Notebook prompt. Templated drafts preserve the continuation instructions and the latest completed sentence or unfinished fragment; older prompt context can be trimmed with a visible notice, without changing the saved document. If the required request cannot fit, including after extensions change its tokenization, generation fails visibly. Extensions must preserve the exact supplied answer prefix and its native token cursor. Transformers tokenizer extensions that supply external `inputs_embeds` are unsupported for this prefix route because the cursor cannot be verified; disable that extension or use raw continuation. Raw continuation and manual Rewrite retain their existing extension behavior.
+**Optional seed sentence** supplies a different retrieval query and rewrite target.
+It must contain one completed sentence only.
+It changes the working copy before application.
+After application, the seed clears only if its text did not change during the operation.
+**Optional writing guidance** supplies additional instructions to the generation model.
 
-**Maximum sentences per automatic generation** defaults to **5**, with a range of **1–100**, for each generation request. The request's original **Max new tokens** supplies a shared draft allowance across sentence-generation passes. It is tracked using the loaded tokenizer's text-token estimate, including reasoning and generated lookahead that is discarded after confirming a sentence boundary. A supplied answer prefix counts toward the prompt context budget; only its generated suffix consumes the draft allowance. In the full-sentence fallback, the generated copied prefix also consumes that allowance. Each rewrite pass has its own finite cap using the current **Max new tokens** setting. These limits are not an exact aggregate limit on backend work or final document length: rewriting adds generation passes and may lengthen or shorten sentences. Automatic mode is consequently slower than ordinary generation. A normal end-of-response in a templated one-sentence draft ends that step; the run can continue from the rewritten sentence until its limits. Natural end-of-output in a raw draft ends the run. Custom stopping strings end either route.
+## Corpus settings
 
-During a run, accepted rewrites appear as a staged preview while the next sentence is being prepared. The final document is applied only after a fresh check that the Notebook input/output and selected prompt still match the run's starting state. Applying accepted text adds one guarded **Undo rewrite** operation for the whole run. In single-column Notebook, **Regenerate** first restores the input from the previous generation request. In two-column Notebook, **Generate** and **Shift+Enter** start from the input; **Continue** starts from the output, including when it is empty. That layout has no **Regenerate** button. Automatic mode writes its accepted document to output.
+These are the initial settings. Saved build settings can replace them.
 
-The run checks that a model is loaded and the selected corpus/settings are current before drafting. Encoder-decoder (`seq2seq`) generation models are explicitly unsupported in automatic mode; manual Rewrite and ordinary generation retain their existing paths. Controls lock for the operation. **Stop generation**, a retrieval failure, no acceptable references, an incomplete rewrite, or a generation error discards the current provisional sentence. Already accepted rewrites remain available, and status explains why the run stopped. The system does not silently resume ordinary generation after such a failure. A stale Notebook edit prevents final application rather than overwriting that edit.
-
-Turning the checkbox off restores the normal Notebook generation callbacks. Chat, API generation, and manual Rewrite are unaffected by the checkbox. This extension changes no corpus cache format; restart the server after updating the code, but do not rebuild a corpus solely to enable automatic mode.
-
-## Models and retrieval settings
-
-The default trained multi-vector checkpoint is [lightonai/LateOn](https://huggingface.co/lightonai/LateOn). The menu also offers [answerai-colbert-small-v1](https://huggingface.co/answerdotai/answerai-colbert-small-v1), [mLateOn](https://huggingface.co/lightonai/mLateOn), and [GTE-ModernColBERT-v1](https://huggingface.co/lightonai/GTE-ModernColBERT-v1). See their model cards for training, languages, and intended use. A custom Hugging Face ID or local trained ColBERT checkpoint is accepted; generic pooled sentence encoders are unsupported. Loading uses the native Sentence Transformers multi-vector encoder, trained projections, safetensors, and no remote code execution.
-
-Use **Model revision** to pin a Hugging Face commit. **Offline: cached/local models only** prevents model downloads, including both reranker models; all required files must already be available. Local checkpoint fingerprints, model identity, library version, file hashes, and settings participate in cache validation. Changed corpus files or build settings require rebuilding. An unchanged index can be reused by clicking Build; **Force rebuild** bypasses reuse and can recover a corrupt cache. Failed builds retain the previously completed database. Correct the error and retry; matching current settings and unchanged sources are required to use that prior corpus. **Clear this corpus** releases this session's models and corpus, preserving source files. It deletes the selected cached database only when another open Rewrite tab is not using or building that shared cache; status reports retention.
-
-| Setting | Default and meaning |
+| Setting | Initial value and function |
 | --- | --- |
-| Embedding token limit | 256; counts the embedding tokenizer's document marker and special tokens. Inputs are never silently truncated. |
-| Embedding batch size | 16; lower it if indexing exhausts memory. |
-| Index sentence windows | Up to 3 consecutive completed sentences, within each file; UI range 1–8. |
-| Top K references | 5; UI range 1–50. Fewer are returned if fewer eligible candidates pass the acceptance rules. |
-| Match length: sentences | Exactly the selected sentence count, default 1, from already indexed windows. |
-| Minimum reference length relative to target | 0.5; sentence mode only. A reference must contain at least half the target's embedding content-token count. This is a minimum, with no corresponding maximum; 0 disables it. |
-| Match length: tokens | Uses the current generation tokenizer, not the embedding tokenizer. Tolerance defaults to 0.15: absolute token-count difference must be at most 15% of the query count. Zero requires an exact count. |
-| Late-interaction score | Symmetric by default: average of the two directional mean token MaxSim scores, using document-role encoding on both sides. Directional mode uses trained query/document roles. |
-| Exclude exact copies | Enabled; excludes identical text after stripping outer whitespace, not paraphrases or case variations. |
-| Reference diversity | 0; increasing it penalizes word-set overlap among selected references. This is textual diversity, not a semantic guarantee. |
+| Trained multi-vector embedding model | `lightonai/LateOn`. A trained ColBERT model supplies token embeddings for retrieval. |
+| Model revision | Empty. A Hugging Face commit identifies a fixed model version. |
+| Offline: cached/local models only | Disabled. When enabled, all retrieval models must be local or cached. |
+| Embedding token limit | 256. This includes document markers and special tokens. |
+| Embedding batch size | 16. A smaller batch uses less memory. |
+| Index windows up to this many sentences | 3. The control lets you select 1–8 consecutive sentences for each window. |
+| Cleanup applied to every corpus file | `conservative`. The table below gives the function of each mode. |
+| Join words hyphenated across lines | Disabled. This control can change compound words that you want to keep. |
+| Ingestion quality screening | `balanced`. This rejects spans with specified signs of damage. |
 
-Token-mode matching still searches only the sentence windows built into the index. It does not construct arbitrary token slices. A single sentence over the embedding limit fails indexing; longer multi-sentence windows over that limit are omitted. Incomplete fragments are not candidates. Change the window or token limits and rebuild when these restrictions leave too few matches.
+The model menu also contains `answerdotai/answerai-colbert-small-v1`, `lightonai/mLateOn`, and `lightonai/GTE-ModernColBERT-v1`.
+A custom Hugging Face identifier or local trained ColBERT checkpoint is permitted.
+Rewrite does not support pooled sentence encoders.
 
-Every corpus file passes through the shared cleanup implementation in `modules/sentence_rewrite/cleanup.py` (version 2). **Cleanup applied to every corpus file** defaults to `conservative`: it removes a leading BOM and soft hyphens, normalizes line endings and horizontal whitespace, joins single line wraps with spaces, and preserves blank-line paragraph boundaries. Unicode U+2028 becomes a line break; U+2029 and form feed become paragraph breaks. Choose `none` to retain decoded source formatting. Opt-in `scanned_book` additionally removes standalone decimal-number lines and `page`/`chapter` labels followed by decimal or Roman numerals, and joins OCR `¬` word wraps. This can remove meaningful numbers or chapter labels; inspect the read-only **Cleanup report**, which shows counts and before/after examples.
+The index contains completed sentence windows from each file.
+It does not contain fragments that are not completed or token slices.
+A single sentence that screening accepts stops the build with an error if its token count is more than the embedding limit.
+The build does not include longer windows with more tokens than that limit.
 
-**Join words hyphenated across lines** defaults to disabled. When enabled with an active cleanup mode, it joins letter-to-letter hard-hyphen wraps; this can alter intended compounds. Cleanup handles formatting and recognized wrap artifacts, not OCR word correction. Source character offsets refer to the original decoded Unicode text, including a leading BOM, rather than the cleaned text or byte positions. A reported span can include removed interior formatting. Changes to cleanup mode, hyphen joining, or cleanup implementation version invalidate the index cache and require a rebuild.
-
-After cleanup, every corpus passes through `modules/sentence_rewrite/quality.py` (quality version 2) before candidate embeddings are created. **Ingestion quality screening** defaults to `balanced`. It excludes spans containing replacement characters, non-whitespace control characters, or punctuation alone. With `scanned_book` cleanup it also checks narrowly defined separator noise, suspicious adjacent period boundaries, certain English OCR quote/contraction patterns, and a detached leading digit before paragraph text. These are inspectable heuristics, not a grammar checker or general OCR repair. They do not change words or punctuation. Short dialogue, lowercase prose, and non-Latin scripts are valid material; a short span is flagged for inspection but remains indexable.
-
-Quality decisions belong to each occurrence and use its original neighboring spans. Any multi-sentence window containing an excluded span is also excluded; the builder never joins across a rejected passage. Source paths, original character offsets, flags, reasons, and surrounding cleaned-text context are retained. The quality report shows counts and a few examples; the completed SQLite cache contains the full exclusion audit. See [the quality design and audit guide](Rewrite-Quality.md) for access and evaluation instructions.
-
-Scanned-book heuristics can exclude deliberate lowercase continuations or other unusual literary constructions. Set screening to `off` and rebuild to retain flagged spans; flags and counts remain available. Cleanup settings still apply independently. Neither setting establishes that a passage is undamaged, and unfamiliar spellings are not automatically corrected. If screening leaves no candidates, the build fails visibly with its quality report and preserves the last completed cache.
-
-Quality policy/version and cache schema participate in cache identity. Schema 2 stores this audit and candidate-length metadata; click **Build corpus / retry** to replace an older index through a normal transactional rebuild. Force rebuild is not required solely because an index uses the old schema. Changing search acceptance or length-ratio settings does not require rebuilding.
-
-The sentence-mode length floor uses `max(0, embedding_token_count(text) − embedding_token_count(""))` to remove the encoder's marker/special-token overhead. It compares model tokens, not linguistic word counts, and is independent of the loaded generation tokenizer. This prevents a one-word response from qualifying automatically for a much longer target while allowing it for short targets. Token mode retains its existing generation-token tolerance and ignores this extra floor.
-
-Retrieval scans every eligible cached token matrix and computes exact late-interaction scores; there is no approximate vector index. CUDA scoring uses bounded float32 batches with padding excluded from token maxima; long pairs use bounded tiles. CPU scoring also uses exact tiled matching. This bounds scoring intermediates rather than loading the entire index onto the GPU. Punctuation is retained and token vectors are normalized. Repeated identical passages share an embedding while retaining occurrence provenance. Generation-token lengths are cached in memory by index generation and generation-model/tokenizer identity, then invalidated when either changes. With extensions enabled the UI avoids cross-search length reuse because extensions can alter tokenization. Changing the tokenizer during retrieval fails the operation rather than mixing counts. Length filtering, full scans, source hashing, and optional reranking can still be expensive on large corpora.
-
-## Meaning and nuance
-
-**Rerank for meaning and nuance** is enabled by default and loads both an [STS cross-encoder](https://huggingface.co/cross-encoder/stsb-roberta-large) and a [DeBERTa NLI checkpoint](https://huggingface.co/MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli) on the selected embedding device. It reranks the top late-interaction pool, default 200 (at least K), using both query→candidate and candidate→query. The composite score is `average(sigmoid(STS logits)) + 0.25 × min(entailment probabilities) − 0.25 × max(contradiction probabilities)`, with each average/minimum/maximum taken across the two directions. This balances semantic similarity with evidence about entailment, negation, and participant roles. The score is a ranking heuristic, not a calibrated equivalence probability. Candidates outside the pool cannot be recovered by reranking. Both models check paired input lengths, including special tokens, in both directions before inference; exceeding either model's limit causes an error rather than truncation.
-
-After reranking, **Minimum semantic similarity** defaults to **0.3** and **Maximum contradiction score** to **0.8**. A candidate must meet both limits before it can become a reference. Set the minimum to 0 or the maximum to 1 to disable that individual filter. Both filters are inactive when meaning-and-nuance reranking is disabled. These English-model scores and thresholds are heuristics, not confidence percentages; they can reject useful indirect style matches or multilingual passages. Adjust them after inspecting your corpus and query. Search returns fewer than K if only some candidates qualify. If none qualify, it reports the reason and generation does not start; it does not fill the requested K with rejected references.
-
-The preview exposes the composite nuance score, semantic similarity, entailment, contradiction, and raw late-interaction score. A late-interaction score near 0.98 does not mean 98% relevance. Neither retrieval nor generation guarantees preservation of every number, name, tense, implication, or qualifier. Review generated text for your use case. Semantic similarity and useful sentence composition are different objectives: the current system has no trained literary-style or syntactic-usefulness ranker. The new checks address damaged and plainly unsuitable references without establishing optimal literary retrieval. See [the quality evaluation record](Rewrite-Quality.md) for evidence and remaining limitations.
-
-## Generation, context, and stopping
-
-Rewriting uses the application's native generation path, current sampling settings and token allowance, and optionally its selected instruction template. The default prompt explicitly preserves participants, actions, facts, polarity, degree, and numbers, and permits reference wording only when compatible with the target's meaning. Every retrieved reference and the target sentence remain in the prompt. Nearby notebook context is retained where possible; older context can be trimmed for the prompt without changing the saved document. If all references plus the target cannot fit, rewriting fails with instructions to reduce K/window size or increase available context. References are never silently dropped.
-
-**Enable model thinking for this rewrite** defaults to disabled. It sets the thinking option for this Rewrite generation request; enable it when you want the loaded model's supported thinking behavior. Gemma testing exhausted both 256- and 1,024-token allowances with thinking enabled and produced no usable final sentence; leave it disabled for short rewrites unless you deliberately allocate a larger budget.
-
-Generation stops at the first confirmed complete sentence. **Stop generation** sets this Rewrite session's cancellation event and preserves the previous notebook text. Cancellation is checked during retrieval source hashing, candidate scoring, nuance reranking, and native generation; model loading or an in-flight inference batch can delay its effect. The button does not set the global stop flag for unrelated generation. Custom stopping strings, exhausted token allowance, or model output that ends before a usable complete sentence can also produce an error; no partial replacement is applied. Native integration uses shared generation with loader-specific token counting and final prompt-budget checks. Backend errors reach the Rewrite status; custom backends release their active requests on cancellation or early generator closure. The validation section records the tested models and loaders.
-
-## Storage, limits, and developer notes
-
-Caches and per-layout build settings live under `user_data/retrieval_indexes` (or the configured user-data directory). They contain corpus text, local paths, and embedding matrices. New cache directories and SQLite files request private permissions (`0700`/`0600`); protect the containing user-data directory as well. Session proposals/history are not persisted. Local server-file retrieval is disabled in multi-user mode, including callbacks.
-
-Current hard limits are 64 MiB per file, 512 MiB total source bytes, 10,000 source files, 200,000 assessed sentence spans, 200,000 considered candidate windows (including excluded windows), 200,000 retained candidate occurrences, and 8 GiB of unique embedding-matrix payload per index. The payload budget excludes SQLite metadata, text, provenance, quality audits, and database overhead. A transactional rebuild temporarily needs space for both the previous completed database and its staged replacement; caches for other configurations also remain on disk. These are rejection bounds, not supported performance targets: multi-vector storage and inference can consume much more memory or disk than raw text. There is no directory watcher or automatic background rebuild.
-
-Implementation is divided between `modules/ui_sentence_rewrite.py` (session state, controls, locking and guarded application) and `modules/sentence_rewrite/`: `sentences.py` (spans), `cleanup.py` (formatting and source mapping), `quality.py` (inspectable per-span quality signals), `embeddings.py` (trained encoder and scores), `corpus.py` (transactional SQLite build/search and audit), `reranker.py` (bidirectional STS and NLI), and `engine.py` (prompt planning and native generation). Builds stage a database and atomically replace the completed cache only after success. Per-session and shared-cache locks prevent overlapping mutations.
-
-## Local literary corpus
-
-An optional preparation script curates three English Project Gutenberg editions: Samuel Butler **1835–1902**, [Erewhon (#1906)](https://www.gutenberg.org/ebooks/1906) and [The Way of All Flesh (#2084)](https://www.gutenberg.org/ebooks/2084), plus Henry James, [The Ambassadors (#432)](https://www.gutenberg.org/ebooks/432). Their catalog entries identify them as public domain in the USA. Obtain the plain-text files as `pg1906.txt`, `pg2084.txt`, and `pg432.txt` in a source directory, then run:
-
-```sh
-python tests/manual/prepare_literary_corpus.py --source-dir /workspace/literary-corpus/sources --output-dir /workspace/literary-corpus/prepared
-```
-
-The original downloads, including their full source and license notices, remain unchanged in `/workspace/literary-corpus/sources`. Curated texts are written under `samuel_butler` and `henry_james` in the output directory; `manifest.json` records URLs, attribution, hashes, and removals outside those author text directories. The script validates the inspected edition markers before writing. It removes front matter/prefaces, headings, illustration labels, Erewhon's final footnotes and reference numbers, and James's editorial chapter-order note. It excludes chapters IV–V of *The Way of All Flesh*, which the editor says he reconstructed. Original prose wording and wrapping are preserved; line endings and blank spacing are normalized. Consult the [Project Gutenberg license](https://www.gutenberg.org/license) for distribution terms.
-
-Enter `/workspace/literary-corpus/prepared/samuel_butler` and `/workspace/literary-corpus/prepared/henry_james` as separate server-local corpus paths. Keep full sources separate from prepared retrieval paths so headers, licenses, and editorial material do not become references. The default **Embedding token limit** for this literary sample is **384**; preparation itself applies no token-length filter, and indexing still rejects any single sentence over the configured limit. This sample setting does not change the UI default of 256.
-
-The user-supplied Nabokov OCR source `/workspace/Untitled.txt` can be prepared separately:
-
-```sh
-python tests/manual/prepare_nabokov_corpus.py --source /workspace/Untitled.txt --output-dir /workspace/literary-corpus/prepared
-```
-
-This writes `/workspace/literary-corpus/prepared/vladimir_nabokov/lolita.txt` and a separate `nabokov_manifest.json` identifying the source as user-provided, with hashes and raw line boundaries. Exact inspected markers retain the narrative from raw line 180 through line 15460, excluding front matter and the author afterword. Every byte between those boundaries remains intact, including all narrative parts, page numbers, line wrapping, and OCR artifacts; the original file remains unchanged. No public-domain or redistribution permission is claimed for this source. Select `scanned_book` during ingestion to apply formatting cleanup to the prepared text and enable the scan-specific quality checks. The historical sample index, before quality screening, contained **4,458 Nabokov candidates**; cleanup reported **73 furniture lines** and **503 OCR `¬` wraps**. Those counts do not describe a newly screened index. Rebuild it and inspect the current report; visible OCR word errors can remain and affect retrieval quality.
-
-The quality-version-2 rebuild assessed **4,518 spans**, excluded **155**, and retained **4,363 occurrences / 4,336 unique candidates** with one-sentence windows. A new private comparison at `/workspace/literary-corpus/retrieval-quality-comparison.html` shows the changed references and explicit refusals. Some weak references remain; see [the quality validation record](Rewrite-Quality.md#current-validation-record) for the settings, observations, and evidence paths.
-
-A historical local comparison saved 72 rewrites: eight neutral queries against each of these three author corpora, with Nemo at temperature 0.3 and Gemma at both 0.3 and 1.0. The runs used seed 42, bf16, and thinking disabled, and were configured to share reference files across models. Saved generation records lack reference snapshots or hashes, so identical references across runs cannot be verified retrospectively. Nabokov cases received additional composition guidance, so cross-author differences do not isolate the corpus alone. In these examples Gemma preserved claims more reliably, while Nemo more often introduced meaning drift or omitted details. Both can still change implications; distinct author voice remains inconsistent. The standalone `/workspace/literary-corpus/comparison.html` contains the outputs and retrieved references from that older pipeline. It exposed weak matches and OCR-derived fragments and is not evidence for the quality of the new ingestion/acceptance settings. This is a small qualitative comparison, with one sample per condition, not an established general model ranking.
-
-## Validation
-
-The automatic extension's final suite passed **510 tests and 17 subtests**, including the explicit CUDA scoring check. Controlled fixtures cover sentence sequencing, partial retention after an accepted rewrite, stale-edit guards, finite budgets, reasoning-template fallback, native prompt/cursor validation, extension transformations, cancellation, and checkbox-off routing. The validation-host log is `/workspace/rewrite-validation/automatic-release-tests.log`. Independent core, native-integration, and workflow source reviews approved after fixes.
-
-Current-code automatic browser workflows passed on Linux with two NVIDIA A40 GPUs:
-
-| Generation loader | Actual automatic-generation model |
+| Cleanup mode | Function |
 | --- | --- |
-| Transformers | Gemma 4 12B IT BF16. |
-| llama.cpp | Mistral-Nemo-Instruct-2407 Q4_K_M GGUF, GPU offload, 4,096-token context, binaries 0.138.0 CUDA 12.4. |
+| `none` | Keeps the decoded source format. |
+| `conservative` | Removes the initial byte-order mark and soft hyphens. Changes whitespace and line endings to the selected format. Puts single line wraps together. Keeps paragraph boundaries. |
+| `scanned_book` | Adds removal of standalone number lines and numbered page or chapter labels. Puts OCR `¬` word wraps together. |
 
-Both runs used Python 3.12.3, PyTorch 2.8.0+cu128, Transformers 5.10.4, Sentence Transformers 6.1.0, and Gradio 4.37.2+custom.21. LateOn plus STS/NLI retrieval ran on `cuda:1`, with the selected instruction template for generation. The browser records include corpus hashes and generation settings: seed 42, temperature 0.3, a 150-token allowance, streaming enabled, and thinking disabled.
+Cleanup does not correct OCR word errors.
+The `scanned_book` mode can remove numbers or headings that you want to keep.
+Hard-hyphen joining can remove hyphens that you want to keep.
+Examine the reports before retrieval.
 
-Each final automatic workflow exercised Generate/Shift+Enter in both layouts, single-column Regenerate, two-column Continue from populated and empty output, a real two-sentence draft/retrieve/rewrite loop, whitespace-correct retrieval queries, both Stop buttons and retry, control locks, whole-run undo, ignored manual seed/review settings, and ordinary generation with the checkbox off. Default acceptance settings refused the first draft for insufficient reference length in both runs and preserved the original text. A minimum semantic score of 1 also verified refusal without editing. Retention after an already accepted sentence and stale edits were verified with controlled unit/UI fixtures, rather than claimed from those default-setting browser runs.
+Balanced screening rejects spans with replacement characters, non-whitespace control characters, or punctuation alone.
+With `scanned_book`, it also applies limited OCR and sentence-boundary rules.
+It can reject literary constructions that you want to keep.
+Short sentences, lowercase prose, and non-Latin scripts stay permitted input.
+The `off` policy keeps flagged spans without quality exclusions.
+Cleanup also applies.
 
-To exercise all mechanical routes against the small synthetic corpus, both runs kept nuance reranking enabled but set the minimum length ratio and semantic score to 0 and maximum contradiction score to 1. Those relaxed runs verify the loop and application controls, not retrieval relevance, meaning preservation, or literary quality. In particular, empty-output Continue verifies its source routing; its generated prose is not a creative-quality benchmark. Final records are `/workspace/rewrite-validation/automatic-gemma-release-browser/browser-results.json` and `/workspace/rewrite-validation/automatic-nemo-release-browser/browser-results.json`. Older automatic artifacts from the earlier prefix-copy implementation are superseded.
+After changes to source files, embedding settings, windows, cleanup, or screening, make the index again.
+Changes to search acceptance settings do not make a corpus rebuild necessary.
 
-Manual Rewrite regression browser workflows also passed for Gemma/Transformers and Nemo/llama.cpp, covering both layouts, failure/build/retry, review conflicts, Stop/retry, seeds/repetition, exact token matching, incomplete/custom-stop errors, undo, and subsequent ordinary generation. Their records are `/workspace/rewrite-validation/automatic-gemma-manual-regression/browser-results.json` and `/workspace/rewrite-validation/automatic-nemo-manual-regression/browser-results.json`. Other automatic-mode loaders, models, platforms, extensions, and sampling configurations were not verified by these real-model runs.
+## Reference selection
 
-The earlier backend/installation validation passed **210 checks and 17 subtests**, including the explicit CUDA scoring check. That result predates ingestion quality screening and must not be read as validation of its new behavior. Current quality-change checks and real-model comparisons are recorded in [Rewrite-Quality.md](Rewrite-Quality.md). The `tests/test_rewrite_*.py` suites cover segmentation, token limits, cache invalidation and transactional failure, retrieval, reranking, prompt budgets, native generation adapters, and UI application guards. They use controlled fixtures for reproducible behavior; these checks do not establish semantic accuracy for arbitrary text or runtime support for every loader.
-
-Earlier manual Rewrite browser workflows passed on Linux with NVIDIA A40 GPUs. This broader loader list does not establish automatic-mode runtime coverage:
-
-| Generation loader | Actual model tested |
+| Setting | Initial value and function |
 | --- | --- |
-| Transformers | Mistral-Nemo-Instruct-2407 BF16 and Gemma 4 12B IT BF16. |
-| llama.cpp | Mistral-Nemo-Instruct-2407 Q4_K_M GGUF, binaries 0.138.0 CUDA 12.4. |
-| ik_llama.cpp | The same Nemo GGUF, ik binaries 0.138.0 CUDA 12.4. |
-| ExLlamav3 | Nemo BF16, ExLlama 0.0.34. |
-| ExLlamav3_HF | Nemo BF16, ExLlama 0.0.34. |
-| TensorRT-LLM | Controlled adapter/worker tests only; actual model runtime remains unverified. |
+| Top K references | 5. The control lets you select 1–50 references. |
+| Match length by | `sentences`. Selects windows with the specified sentence count. |
+| Sentences per reference | 1. |
+| Minimum reference length relative to target | 0.5. In sentence mode, the reference must contain half the target's embedding content-token count or more. Zero disables this limit. |
+| Generation-token length tolerance | 0.15. The maximum difference is 15% of the query token count. Zero makes the counts the same. |
+| Late-interaction score | `symmetric`. Compares token matches in the two directions. |
+| Exclude exact copies of the query | Enabled. Ignores outer whitespace when it compares text. Letter case must also be the same. |
+| Reference diversity | 0. Higher values decrease word-set overlap among references. |
+| Rerank for meaning and nuance | Enabled. Uses English STS and NLI models. |
+| Late-interaction candidates to rerank | 200, or K if K is larger. The rerankers use only this pool. |
+| Minimum semantic similarity | 0.3. Zero disables this filter. |
+| Maximum contradiction score | 0.8. One disables this filter. |
 
-Each completed browser workflow covers real corpus ingestion and retrieval, build lock/failure/retry, both Notebook layouts, sentence replacement with surrounding text preserved, manual seeds, repeated rewrites, Stop/retry, review conflicts, undo, exact token matching, incomplete-output and custom-stop recovery, and subsequent ordinary Notebook generation. This verifies the exercised models and settings; it does not establish compatibility with every model, extension, or sampling configuration.
+Token mode uses the loaded generation tokenizer.
+Sentence mode uses embedding content-token counts for its minimum length ratio.
+Neither mode makes windows that the build did not include.
 
-Fresh Linux Python 3.13 profiles were also installed independently of the original development environment:
+The system can supply less than K references.
+If the system rejects all references, generation does not start.
+There is no substitution with rejected references.
+If you disable meaning-and-nuance reranking, the system disables its semantic and contradiction filters.
 
-- CUDA 12.4 portable: PyTorch 2.6.0+cu124, Transformers 5.6.2, Sentence Transformers 6.1.0; dependency checks, packaged-module imports, and the entire browser workflow passed with both generation and retrieval on GPUs.
-- CPU portable: PyTorch 2.9.0+cpu with the same Transformers/Sentence Transformers versions; dependency checks, imports, and real LateOn → SQLite → exact MaxSim → STS/NLI reranking passed on CPU.
-- Full NVIDIA: PyTorch 2.9.0+cu128, Transformers 5.6.2, Sentence Transformers 6.1.0; dependency checks, imports, and the complete Nemo BF16/ExLlamav3 browser workflow passed using the shipped ExLlama 0.0.34 and Flash Attention 2.8.3 wheels.
+Scores are model outputs, not confidence percentages.
+The English rerankers can reject style examples or text in other languages.
+Retrieval and generation cannot make sure that the meaning or an author's style stays the same.
+Examine facts, names, numbers, and qualifiers in the result.
 
-The full upstream dependency set emits a TorchAO 0.15 C++ extension compatibility warning with PyTorch 2.9; TorchAO-quantized checkpoints were not part of these model runs.
+## Generation controls
 
-Windows, macOS, ROCm and CUDA 13.1 package runtime checks, Docker image builds, and Colab execution were not performed on this Linux host. Their installation routes and build checks were reviewed; Docker data exclusions were additionally checked using Docker's pattern matcher. No portable release archive has been published by this verification work.
+Rewrite uses the native generation path and the selected sampling settings.
+**Use the selected instruction template** is initially enabled.
+**Enable model thinking for this rewrite** is initially disabled.
+Model thinking can use the token allowance before the model supplies a completed replacement.
 
-The optional TensorRT loader can use a separate dependency environment so its older Transformers requirements do not replace the retrieval stack. On Linux with Python 3.12 and OpenMPI installed, run `python scripts/setup_tensorrt.py`; it creates `user_data/tensorrt_runtime` with TensorRT-LLM 1.0.0 and CUDA 12.8 PyTorch 2.7.1. The loader detects that environment, or accepts `--tensorrt-llm-python /path/to/bin/python`. This runtime path remains experimental until a real engine build and generation run complete.
+The prompt keeps the target and all selected references.
+It can remove previous Notebook context from the prompt to stay in the context limit.
+The status shows this change.
+If the target and references are too long for the context limit, the operation stops with an error.
+If the prompt is too long, decrease K.
+A smaller reference length or a larger context limit also gives more space.
 
-For an opt-in browser smoke workflow, install Playwright and its Chromium browser in your developer environment, start textgen with a generation model loaded and Rewrite dependencies installed, then run:
+**Stop generation** cancels this Rewrite operation.
+The system can wait for model loading or an active inference batch before cancellation.
+A replacement that is not completed, or a model error, prevents manual application.
+A token limit or custom stopping string can leave the replacement without a completed sentence.
 
-```sh
-python -m pip install playwright
-python -m playwright install chromium
-python tests/manual/rewrite_browser.py --url http://127.0.0.1:7860 --device cuda:1 --output-dir rewrite-browser-artifacts
-```
+## Automatic mode
 
-The default corpus is `tests/fixtures/rewrite_reference_sentences.txt`; override it with `--corpus /absolute/path/to/references.txt`. The script and server must share the same filesystem because resolved paths are submitted as server-local paths. Use a scratch Notebook/session: the script changes text, sampling settings, and layout, explicitly starts with one column, and sets seed 42 and temperature 0.3. It exercises failure/retry, lock states, previews, application/undo, stale-proposal protection, stopping, seed/repeat behavior, exact token matching, incomplete output and custom-stop errors, ordinary generation, and two-column output. JSON results are saved even on exceptions; a successful run also saves a screenshot. These live checks depend on the loaded model and hardware, and are not part of the default unit suite.
+1. Load a generation model.
+2. Build a corpus.
+3. Enable **Automatically retrieve and rewrite generated sentences**.
+4. Set **Maximum sentences per automatic generation**.
+5. Start Notebook generation.
 
-Run the separate automatic workflow against the same kind of scratch server with a real model loaded:
+The checkbox is initially disabled. The browser session keeps its state.
+The initial sentence limit is 5. The control lets you select 1–100.
+The model generates one sentence, finds references, and rewrites that sentence before it continues.
+The system keeps completed sentences from the initial document the same.
+An initial sentence that is not completed can change after the model completes and rewrites it.
 
-```sh
-python tests/manual/rewrite_automatic_browser.py --url http://127.0.0.1:7860 --device cuda:1 --output-dir rewrite-automatic-artifacts
-```
+| Control | Starting text |
+| --- | --- |
+| Generate or Shift+Enter, either layout | Input. |
+| Regenerate, single-column layout | Input from the previous generation request. |
+| Continue, two-column layout | Output. Empty output also applies. |
 
-It uses the same default corpus and server-local path convention, changes text/settings/layout, and records both acceptance refusals and deliberately relaxed mechanical tests. It checks the six native generation routes, sentence iteration, source selection, Stop/retry, undo, locks, and checkbox-off ordinary generation. Do not interpret a mechanical pass with relaxed thresholds as a retrieval-quality result.
+Plain Enter inserts a newline.
+Automatic mode uses the reference settings, writing guidance, template selection, and rewrite thinking control.
+It ignores the manual seed and review controls.
+A decoder-only generation model is necessary.
+Automatic mode does not support encoder-decoder models.
+
+With **Use the selected instruction template** enabled and a template selected, the draft prompt asks for the next sentence.
+For input that is not completed, the template can use the same fragment as an answer prefix.
+If it cannot use that prefix, it asks for the completed sentence.
+It makes sure that the copied prefix is the same.
+A changed prefix stops the operation before retrieval.
+If the control is disabled or no template is selected, drafting uses raw Notebook continuation.
+
+The initial **Max new tokens** is a shared estimated draft allowance for the run.
+Model reasoning and discarded lookahead use that allowance.
+Each rewrite receives an allowance from the same setting for that rewrite only.
+These limits do not give the total backend token count or final document length.
+Automatic mode uses more generation work than usual Notebook generation.
+
+A usual template response can stop one draft while the operation continues.
+Raw end-of-output stops the run.
+Custom stopping strings stop either route.
+Stop or an error discards the temporary sentence.
+Accepted rewrites can apply after the final check of the input, output, and prompt.
+An edit during the operation prevents application.
+
+One **Undo rewrite** operation puts back the text from before the applied run.
+
+If you disable the checkbox, the system uses usual Notebook generation again.
+Automatic mode does not change corpus cache format.
+Activation does not make a corpus rebuild necessary.
+
+## Storage and limits
+
+Caches and build settings are under `user_data/retrieval_indexes`, or the selected user-data directory.
+Caches contain source text, local paths, and embeddings.
+The browser session keeps proposals and undo history.
+Multi-user mode does not let Rewrite retrieve server files.
+There is no directory watcher or background rebuild.
+
+| Per-index limit | Maximum |
+| --- | --- |
+| One source file | 64 MiB. |
+| Total source bytes | 512 MiB. |
+| Source files | 10,000. |
+| Examined sentence spans | 200,000. |
+| Examined windows and exclusions | 200,000. |
+| Kept candidate occurrences | 200,000. |
+| Unique embedding payload | 8 GiB. |
+
+These are rejection limits, not performance targets.
+Text, metadata, audit records, and database overhead use additional storage.
+A rebuild uses space for the previous database and its replacement.
+Other cache configurations also stay on disk.

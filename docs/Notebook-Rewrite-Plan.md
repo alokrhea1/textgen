@@ -1,36 +1,39 @@
-# Notebook retrieval rewrite: implementation plan
+# Notebook Rewrite: historical plan
 
-**Historical design record.** This is the original implementation plan, not the
-current maintenance specification. Retrieval dependencies are now included in
-supported installation profiles (model loading remains lazy), and LateOn plus
-STS/NLI reranking is implemented. See [current behavior](Notebook-Rewrite.md) and
-the [upstream maintenance guide](UPSTREAM-MAINTENANCE.md) before changing the fork.
+This document records the initial design.
+It is not the specification for the feature.
+The initial upstream baseline was `c93f8871239550de2ccfe1e95d469aa82616f07e`.
 
-Upstream baseline: `c93f8871239550de2ccfe1e95d469aa82616f07e`.
+For operation, refer to [Notebook sentence rewriting](Notebook-Rewrite.md).
+For code changes and validation, refer to [Rewrite development](Rewrite-Development.md).
+For upstream integration, refer to [Upstream maintenance](UPSTREAM-MAINTENANCE.md).
 
-The requested workflow is an explicit Rewrite button in a sixth Notebook subtab. A local TXT corpus supplies top-K examples for regenerating the last completed period-delimited sentence. Users may edit a seed sentence and repeat indefinitely. Ordinary generation must remain unchanged.
+## Initial design
 
-## Design and implementation sequence
+The initial feature was a manual Rewrite button in the sixth Notebook subtab.
+A local TXT corpus supplied top-K references for the last completed sentence.
+A period parser kept the target span and all other characters.
+Users could supply a seed sentence and do the operation again.
+The design kept usual generation the same.
 
-1. Preserve source spans with one period-aware sentence parser shared by indexing, target selection, streaming completion, and replacement. Preserve both preceding text and incomplete trailing text exactly.
-2. Use trained ColBERT contextual token matrices, with Sentence Transformers' native MultiVectorEncoder. Compare model-native query/document mean MaxSim with symmetric document/document mean MaxSim. Provide GTE-ModernColBERT and AnswerAI ColBERT-small choices. Do not substitute pooled vectors or lexical search for the requested multi-vector retrieval.
-3. Build a persistent, private SQLite corpus from explicit files and recursive directories. Index bounded contiguous sentence windows, deduplicate text, preserve provenance, validate lengths, fingerprint inputs/model settings, and activate only complete indexes. Display progress; disable all tab controls during construction; restore controls with an explicit error and retry on failure.
-4. Search every eligible candidate using bounded-memory late interaction and a bounded top-K heap. Offer sentence-count and generation-token-length eligibility, exact-token matching, optional diversity, exact-match exclusion, and transparent result scores/source excerpts.
-5. Render references and the target using native templates or a plain completion prompt. Budget the fully rendered prompt with the loaded model tokenizer. Keep all selected references or fail explicitly; trim older context first. Use native generation, samplers, hooks, and stop handling. Stage output before applying it to a fresh, unchanged source snapshot.
-6. Expose the workflow in both Notebook layouts, with an editable seed, retrieval-only preview, optional review before applying, guarded application and undo, cache reuse/rebuild/clear, and optional offline model loading. Never trigger generation from edits, tab selection, or indexing.
-7. Validate centrally: parser/index/scoring/lifecycle contracts, real embedding models, real Gradio callbacks/browser behavior, and native generation integration. Agents author/review code but do not run tests or benchmarks. Compare scoring approaches on a small diagnostic corpus; report its limited scope.
-8. After implementation, recruit fresh independent review agents plus an adversarial reviewer. Address findings and obtain agreement from every reviewer before completion.
+The design selected trained contextual token embeddings and late interaction.
+The initial encoders were GTE-ModernColBERT and AnswerAI ColBERT-small.
+Corpus storage used a private SQLite cache with source locations.
+The design made each cache available after a completed build only.
+The search used sentence-count or generation-token eligibility.
+The prompt used native templates, samplers, and token budgets.
+Application and undo used session state guards.
 
-## Integration constraints
+## Changes after the plan
 
-- Keep heavy retrieval dependencies optional and lazily imported.
-- Preserve native loader abstraction and close generation iterators on every exit.
-- Do not expose corpus files or persisted indexes through Gradio file serving.
-- Keep session state and cancellation separate; validate stale edits before apply/undo.
-- Disable server-file operations in multi-user mode with backend checks.
-- Treat corpus excerpts as prompt data and load retrieval models without remote code execution.
-- Do not silently truncate sentences, ignore unreadable inputs, reuse stale indexes, replace failed output, or claim retrieval scores measure factual equivalence.
+The feature includes these additions:
 
-## Evidence required for completion
+- Retrieval dependencies in supported installation profiles, with model loading before the first operation.
+- LateOn as the initial encoder selection.
+- Bidirectional STS and NLI reranking.
+- Shared format cleanup and ingestion quality screening.
+- Reference acceptance limits and source audits.
+- Automatic sentence rewriting during Notebook generation.
 
-Tests and runtime checks must cover complete and failed indexing with retry, persisted cache reuse/invalidation, exact replacement and repeated manual rewriting, both length modes, actual token matrices and late interaction, stop/error recovery, preview/apply/undo conflicts, UI control locking, and coexistence with normal Notebook generation. Backend-specific limits and any untested combinations must be stated accurately.
+The user and developer guides give the functions of those additions.
+This plan does not show loader compatibility or test results.
