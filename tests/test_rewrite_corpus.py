@@ -582,3 +582,43 @@ def test_contradiction_cutoff_blocks_wrong_roles_despite_high_semantic_score(tmp
 def test_contradiction_threshold_requires_component_scores(tmp_path, reranker):
     with pytest.raises(ValueError, match='requires nuance reranking'):
         CorpusIndex(tmp_path).search('query', FakeEncoder(), reranker=reranker, max_contradiction_score=0.8)
+
+
+def test_missing_absolute_slash_gives_correction_without_using_it(tmp_path, monkeypatch):
+    if tmp_path.anchor != '/':
+        pytest.skip('Missing-slash guidance applies to POSIX paths.')
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / 'references.txt'
+    source.write_text('A complete sentence.', encoding='utf-8')
+    entered = str(source).lstrip('/')
+    index = CorpusIndex(tmp_path / 'cache')
+    encoder = FakeEncoder()
+    with pytest.raises(ValueError) as error:
+        index.build(CorpusConfig(entered), encoder)
+    assert f'Corpus path does not exist: {tmp_path / entered}' in str(error.value)
+    assert f'Entered path: {entered}' in str(error.value)
+    assert f'Relative paths start from {tmp_path}.' in str(error.value)
+    assert f'For an absolute path, enter: {source}' in str(error.value)
+    assert not index.ready
+    assert encoder.encoded == 0
+
+
+@pytest.mark.parametrize('absolute', [False, True])
+def test_corpus_paths_keep_relative_and_absolute_resolution(tmp_path, monkeypatch, absolute):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / 'references.txt'
+    source.write_text('A complete sentence.', encoding='utf-8')
+    entered = str(source) if absolute else source.name
+    index = CorpusIndex(tmp_path / 'cache')
+    manifest = index.build(CorpusConfig(entered), FakeEncoder())
+    assert manifest['candidates'] == 1
+    assert manifest['signature']['files'][0]['path'] == str(source)
+
+
+def test_missing_relative_path_shows_base_without_guessing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    index = CorpusIndex(tmp_path / 'cache')
+    with pytest.raises(ValueError) as error:
+        index.build(CorpusConfig('missing.txt'), FakeEncoder())
+    assert f'Relative paths start from {tmp_path}.' in str(error.value)
+    assert 'For an absolute path' not in str(error.value)

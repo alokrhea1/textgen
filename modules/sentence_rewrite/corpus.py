@@ -91,18 +91,27 @@ def _sources(config, progress, cancel_event=None):
         raise ValueError('Invalid corpus cleanup mode.')
     if config.quality_policy not in QUALITY_POLICIES:
         raise ValueError('Corpus quality policy must be balanced or off.')
-    paths = [Path(x.strip()).expanduser().absolute() for x in config.paths.splitlines() if x.strip()]
+    paths = [Path(x.strip()).expanduser() for x in config.paths.splitlines() if x.strip()]
     if not paths:
         raise ValueError('Enter at least one local text file or directory.')
     files = set()
     def walk_error(error):
         raise ValueError(f'Cannot read corpus directory: {error.filename}: {error}') from error
-    for root in paths:
+    for entered in paths:
+        root = entered.absolute()
         check_cancelled()
         if root.is_symlink() or any(parent.is_symlink() for parent in root.parents):
             raise ValueError(f'Symlink corpus paths are not supported: {root}')
         if not root.exists():
-            raise ValueError(f'Corpus path does not exist: {root}')
+            message = f'Corpus path does not exist: {root}'
+            if not entered.is_absolute():
+                base = Path.cwd()
+                message += f'\nEntered path: {entered}\nRelative paths start from {base}.'
+                prefix = base.parts[1:]
+                if base.anchor == '/' and prefix and entered.parts[:len(prefix)] == prefix:
+                    absolute = Path(base.anchor) / entered
+                    message += f'\nFor an absolute path, enter: {absolute}'
+            raise ValueError(message)
         if root.is_dir():
             found = 0
             for directory, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
